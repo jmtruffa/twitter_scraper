@@ -121,6 +121,8 @@ def parse_bcra_image_with_openai(img_path: Path) -> dict:
         "'fecha' (yyyy-mm-dd), 'reservas_millones_usd' (float), "
         "'compra_venta_divisas_millones_usd' (float). "
         "Si Compra/Venta dice 'Sin intervención', devolvé 0.0. "
+        "Si dice Venta de divisas en millones de USD, usá ese valor negativo."
+        "Si dice Compra de divisas en millones de USD, usá ese valor positivo."
         "No incluyas texto fuera del JSON."
     )
 
