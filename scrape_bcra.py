@@ -116,15 +116,21 @@ def parse_bcra_image_with_openai(img_path: Path) -> dict:
     b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
     data_url = f"data:{mime};base64,{b64}"
 
-    prompt = (
-        "Procesá la imagen y devolvé SOLO un JSON con los campos: "
-        "'fecha' (yyyy-mm-dd), 'reservas_millones_usd' (float), "
-        "'compra_venta_divisas_millones_usd' (float). "
-        "Si Compra/Venta dice 'Sin intervención', devolvé 0.0. "
-        "Si dice Venta de divisas en millones de USD, usá ese valor negativo."
-        "Si dice Compra de divisas en millones de USD, usá ese valor positivo."
-        "No incluyas texto fuera del JSON."
-    )
+    # --- cargar prompt desde archivo ./prompt.txt ---
+    prompt_file = Path(__file__).parent / "prompt.txt"
+    if not prompt_file.exists():
+        raise FileNotFoundError("No se encontró prompt.txt en el mismo directorio del script.")
+    prompt = prompt_file.read_text(encoding="utf-8").strip()
+
+    # prompt = (
+    #     "Procesá la imagen y devolvé SOLO un JSON con los campos: "
+    #     "'fecha' (yyyy-mm-dd), 'reservas_millones_usd' (float), "
+    #     "'compra_venta_divisas_millones_usd' (float). "
+    #     "Si Compra/Venta dice 'Sin intervención', devolvé 0.0. "
+    #     "Si dice Venta de divisas en millones de USD, usá ese valor negativo."
+    #     "Si dice Compra de divisas en millones de USD, usá ese valor positivo."
+    #     "No incluyas texto fuera del JSON."
+    # )
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -169,7 +175,7 @@ def build_engine() -> Engine:
 
 def save_reservas_to_db(engine: Engine, parsed: dict) -> int:
     """
-    Inserta en la tabla tmp_reservas (date, valor)
+    Inserta en la tabla reservas_scrape (date, valor)
     el valor 'reservas_millones_usd' que vino del JSON.
     - date: parsed['fecha'] (yyyy-mm-dd)
     - valor: float
@@ -266,7 +272,7 @@ def main():
     print(f"✅ Inserted {n1} rows into \"comprasMULCBCRA\"")
 
     n2 = save_reservas_to_db(engine, parsed)
-    print(f"✅ Inserted {n2} rows into tmp_reservas")
+    print(f"✅ Inserted {n2} rows into reservas_scrape")
     print("=== Proceso finalizado ===")
 
 if __name__ == "__main__":
