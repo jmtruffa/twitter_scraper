@@ -104,6 +104,18 @@ def download_bcra_image() -> Path:
 # === FUNCIONES DE PARSEO CON OPENAI ======================
 # =========================================================
 
+def get_base_dir() -> Path:
+    """
+    Devuelve el directorio base donde buscar recursos (prompt.txt).
+    - En modo normal: el directorio del .py
+    - En modo PyInstaller (frozen): el directorio del ejecutable
+    """
+    if getattr(sys, "frozen", False):
+        # Ejecutable de PyInstaller
+        return Path(sys.executable).resolve().parent
+    # Ejecución normal
+    return Path(__file__).resolve().parent
+
 def parse_bcra_image_with_openai(img_path: Path) -> dict:
     """Envía la imagen a OpenAI y devuelve el JSON estructurado."""
     client = OpenAI()  # usa OPENAI_API_KEY del entorno
@@ -116,21 +128,14 @@ def parse_bcra_image_with_openai(img_path: Path) -> dict:
     b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
     data_url = f"data:{mime};base64,{b64}"
 
-    # --- cargar prompt desde archivo ./prompt.txt ---
-    prompt_file = Path(__file__).parent / "prompt.txt"
-    if not prompt_file.exists():
-        raise FileNotFoundError("No se encontró prompt.txt en el mismo directorio del script.")
-    prompt = prompt_file.read_text(encoding="utf-8").strip()
+    # --- cargar prompt desde archivo prompt.txt al lado del ejecutable / script ---
+    base_dir = get_base_dir()
+    prompt_file = base_dir / "prompt.txt"
 
-    # prompt = (
-    #     "Procesá la imagen y devolvé SOLO un JSON con los campos: "
-    #     "'fecha' (yyyy-mm-dd), 'reservas_millones_usd' (float), "
-    #     "'compra_venta_divisas_millones_usd' (float). "
-    #     "Si Compra/Venta dice 'Sin intervención', devolvé 0.0. "
-    #     "Si dice Venta de divisas en millones de USD, usá ese valor negativo."
-    #     "Si dice Compra de divisas en millones de USD, usá ese valor positivo."
-    #     "No incluyas texto fuera del JSON."
-    # )
+    if not prompt_file.exists():
+        raise FileNotFoundError(f"No se encontró prompt.txt en {prompt_file}")
+
+    prompt = prompt_file.read_text(encoding="utf-8").strip()
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -154,6 +159,7 @@ def parse_bcra_image_with_openai(img_path: Path) -> dict:
     except Exception:
         raise RuntimeError(f"No se recibió JSON válido: {out}")
     return data
+
 
 
 # =========================================================
