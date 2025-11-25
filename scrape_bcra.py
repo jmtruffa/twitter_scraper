@@ -1,5 +1,6 @@
 # bcra_daily_parser.py
 import os, json, base64, requests, re
+import sys, traceback
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -96,7 +97,7 @@ def download_bcra_image() -> Path:
     ir.raise_for_status()
     out_path.write_bytes(ir.content)
 
-    print(f"✅ Imagen descargada: {out_path}")
+    print(f"✅ Imagen descargada: {out_path}", flush=True)
     return out_path
 
 
@@ -176,8 +177,23 @@ def build_engine() -> Engine:
     if not all([db_user, db_password, db_host, db_name]):
         raise RuntimeError("Faltan variables de entorno de Postgres (POSTGRES_USER/PASSWORD/HOST/DB).")
 
+    print(f"[DB] Conectando a Postgres host={db_host} port={db_port} db={db_name} user={db_user}", flush=True)
     DATABASE_URL = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-    return create_engine(DATABASE_URL)
+
+    # Sumar pre_ping y timeout
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
+
+    # Verificación temprana de conexión para loguear errores en el acto
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("[DB] ✔ Conexión a Postgres verificada (SELECT 1)", flush=True)
+    except Exception as e:
+        print(f"[DB] ❌ Error conectando a Postgres: {e}", file=sys.stderr)
+        traceback.print_exc()
+        raise
+
+    return engine
 
 def save_reservas_to_db(engine: Engine, parsed: dict) -> int:
     """
@@ -207,15 +223,23 @@ def save_reservas_to_db(engine: Engine, parsed: dict) -> int:
     except Exception:
         raise ValueError(f"Valor de reservas_millones_usd inválido: {valor}")
 
+    print(f"[DB] Insert reservas_scrape fecha={fecha} valor={valor}", flush=True)
+
     insert_sql = text("""
         INSERT INTO public.reservas_scrape (date, valor)
         VALUES (:fecha, :valor)
     """)
 
     with engine.begin() as conn:
-        res = conn.execute(insert_sql, {"fecha": fecha, "valor": valor})
-        return res.rowcount if (res.rowcount is not None and res.rowcount >= 0) else 1
-
+        try:
+            res = conn.execute(insert_sql, {"fecha": fecha, "valor": valor})
+            rc = res.rowcount if (res.rowcount is not None and res.rowcount >= 0) else 1
+            print(f"[DB] reservas_scrape rowcount={rc}", flush=True)
+            return rc
+        except Exception as e:
+            print(f"[DB] ❌ Error insertando en reservas_scrape: fecha={fecha} valor={valor} -> {e}", file=sys.stderr)
+            traceback.print_exc()
+            raise
 
 def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
     """
@@ -243,9 +267,8 @@ def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
     except Exception:
         raise ValueError(f"Valor de compra_venta_divisas_millones_usd inválido: {valor}")
 
-    # IMPORTANTE: usar identificadores entre comillas para preservar mayúsculas
-    # Tabla: "comprasMULCBCRA"; columna: "comprasBCRA"
-    # ponemos upsert para evitar duplicados si se corre varias veces el mismo día
+    print(f"[DB] Upsert comprasMULCBCRA fecha={fecha} valor={valor}", flush=True)
+
     insert_sql = text("""
         INSERT INTO "public"."comprasMULCBCRA" (date, "comprasBCRA")
         VALUES (:fecha, :valor)
@@ -253,9 +276,15 @@ def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
     """)
 
     with engine.begin() as conn:
-        res = conn.execute(insert_sql, {"fecha": fecha, "valor": valor})
-        # res.rowcount puede venir como -1 en algunos drivers; consideramos 1 si no falla
-        return res.rowcount if (res.rowcount is not None and res.rowcount >= 0) else 1
+        try:
+            res = conn.execute(insert_sql, {"fecha": fecha, "valor": valor})
+            rc = res.rowcount if (res.rowcount is not None and res.rowcount >= 0) else 1
+            print(f"[DB] comprasMULCBCRA rowcount={rc}", flush=True)
+            return rc
+        except Exception as e:
+            print(f"[DB] ❌ Error upsert en comprasMULCBCRA: fecha={fecha} valor={valor} -> {e}", file=sys.stderr)
+            traceback.print_exc()
+            raise
 
 
 # =========================================================
@@ -263,23 +292,38 @@ def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
 # =========================================================
 
 def main():
-    print("=== Descargando imagen del BCRA desde X ===")
+    print("=== Descargando imagen del BCRA desde X ===", flush=True)
+    print(f"[RUN] CWD: {Path.cwd()}", flush=True)
+
     img_path = download_bcra_image()
 
-    print("=== Enviando imagen a OpenAI para parseo ===")
+    print("=== Enviando imagen a OpenAI para parseo ===", flush=True)
     parsed = parse_bcra_image_with_openai(img_path)
-    print("JSON parseado:")
-    print(json.dumps(parsed, indent=2, ensure_ascii=False))
+    print("JSON parseado:", flush=True)
+    print(json.dumps(parsed, indent=2, ensure_ascii=False), flush=True)
 
-    print("=== Guardando en Postgres ===")
-    engine = build_engine()
+    print("=== Guardando en Postgres ===", flush=True)
+    try:
+        engine = build_engine()
+        print("[DB] Engine construido OK", flush=True)
+    except Exception:
+        return
 
-    n1 = save_compra_venta_to_db(engine, parsed)
-    print(f"✅ Inserted {n1} rows into \"comprasMULCBCRA\"")
+    try:
+        print("[DB] -> Guardando comprasMULCBCRA...", flush=True)
+        n1 = save_compra_venta_to_db(engine, parsed)
+        print(f"✅ Inserted {n1} rows into \"comprasMULCBCRA\"", flush=True)
+    except Exception:
+        return
 
-    n2 = save_reservas_to_db(engine, parsed)
-    print(f"✅ Inserted {n2} rows into reservas_scrape")
-    print("=== Proceso finalizado ===")
+    try:
+        print("[DB] -> Guardando reservas_scrape...", flush=True)
+        n2 = save_reservas_to_db(engine, parsed)
+        print(f"✅ Inserted {n2} rows into reservas_scrape", flush=True)
+    except Exception:
+        return
+
+    print("=== Proceso finalizado ===", flush=True)
 
 if __name__ == "__main__":
     main()
