@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from openai import OpenAI
+from PIL import Image
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -15,6 +16,8 @@ X_API_BASE = "https://api.twitter.com/2"
 USERNAME = "BancoCentral_AR"
 SAVE_DIR = Path("./bcra_imagenes")
 CACHE_FILE = Path(".bcra_x_cache.json")
+DEFAULT_OCR_BACKENDS = ["huggingface", "openai"]
+_HF_OCR_CACHE = None
 
 
 # =========================================================
@@ -54,6 +57,14 @@ def get_user_id(username: str) -> str:
 def download_bcra_image() -> Path:
     """Descarga la imagen diaria del tweet #DataBCRA."""
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    fname = f"bcra_{ba_today().isoformat()}.jpg"
+    out_path = SAVE_DIR / fname
+
+    # Si ya existe la imagen de hoy, reutilizarla para evitar golpear la API.
+    if out_path.exists() and out_path.stat().st_size > 0:
+        print(f"♻️ Imagen ya descargada, reusando: {out_path}", flush=True)
+        return out_path
+
     user_id = get_user_id(USERNAME)
 
     url = f"{X_API_BASE}/users/{user_id}/tweets"
@@ -90,8 +101,6 @@ def download_bcra_image() -> Path:
         raise RuntimeError("No encontré tuit de HOY con #DataBCRA y foto.")
 
     img_url = chosen["photos"][0]
-    fname = f"bcra_{ba_today().isoformat()}.jpg"
-    out_path = SAVE_DIR / fname
 
     ir = requests.get(img_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
     ir.raise_for_status()
@@ -160,6 +169,210 @@ def parse_bcra_image_with_openai(img_path: Path) -> dict:
     except Exception:
         raise RuntimeError(f"No se recibió JSON válido: {out}")
     return data
+
+
+# =========================================================
+# === UTILIDADES DE PARSEO OCR ============================
+# =========================================================
+
+_DATE_PATTERNS = [
+    (re.compile(r"\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b"), "dmy"),
+    (re.compile(r"\b(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})\b"), "ymd"),
+]
+
+
+def _normalize_number_es(raw: str) -> float:
+    """Convierte números estilo ES/EN (1.716,5 / 1,716.5 / 1716) a float."""
+    cleaned = re.sub(r"[^\d,.\-]", "", raw.strip())
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "," in cleaned and "." not in cleaned:
+        cleaned = cleaned.replace(",", ".")
+    try:
+        return float(cleaned)
+    except Exception:
+        raise ValueError(f"No pude parsear número: '{raw}' -> '{cleaned}'")
+
+
+def _extract_fecha(texto: str) -> str:
+    """Devuelve fecha yyyy-mm-dd encontrada en el texto; fallback: hoy BA."""
+    for rx, fmt in _DATE_PATTERNS:
+        match = rx.search(texto)
+        if not match:
+            continue
+        if fmt == "dmy":
+            d, mth, y = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        else:
+            y, mth, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        try:
+            return datetime(y, mth, d).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ba_today().strftime("%Y-%m-%d")
+
+
+def _clean_text(texto: str) -> str:
+    texto = texto.replace("\u2212", "-")
+    return re.sub(r"[ \t]+", " ", texto)
+
+
+def parse_bcra_text_to_json(texto_ocr: str) -> dict:
+    """
+    Parsea el texto OCR y devuelve {fecha, reservas_millones_usd, compra_venta_divisas_millones_usd}.
+    """
+    texto = _clean_text(texto_ocr)
+    low = texto.lower()
+
+    fecha = _extract_fecha(texto)
+
+    reservas = None
+    m_res = re.search(r"(reserva\w*.*?)([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
+    if m_res:
+        try:
+            reservas = _normalize_number_es(m_res.group(2))
+        except Exception:
+            reservas = None
+    if reservas is None:
+        around = re.search(r"rese\w+.{0,40}?([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
+        if around:
+            try:
+                reservas = _normalize_number_es(around.group(1))
+            except Exception:
+                reservas = None
+
+    compra_venta = 0.0
+    if "sin intervención" in low or "sin intervencion" in low:
+        compra_venta = 0.0
+    else:
+        m_cv = re.search(r"(compra|venta|intervenci[oó]n|mulc)\D{0,40}([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
+        if m_cv:
+            try:
+                compra_venta = _normalize_number_es(m_cv.group(2))
+            except Exception:
+                compra_venta = 0.0
+        else:
+            m_any = re.search(r"([-+]\s*[\d\.,]+)\s*(m|millones|usd|u\$s|us\$|d[oó]lares)", texto, flags=re.IGNORECASE)
+            if m_any:
+                try:
+                    compra_venta = _normalize_number_es(m_any.group(1))
+                except Exception:
+                    compra_venta = 0.0
+
+    if reservas is None:
+        raise RuntimeError("No pude extraer 'reservas_millones_usd' del OCR.")
+
+    return {
+        "fecha": fecha,
+        "reservas_millones_usd": float(reservas),
+        "compra_venta_divisas_millones_usd": float(compra_venta),
+    }
+
+
+# =========================================================
+# === OCR LOCAL CON HUGGING FACE ==========================
+# =========================================================
+
+def _resolve_hf_device(torch_mod):
+    preference = os.environ.get("HF_OCR_DEVICE", "cpu").lower()
+    if preference == "cuda" and torch_mod.cuda.is_available():
+        return torch_mod.device("cuda")
+    if preference == "mps" and getattr(torch_mod.backends, "mps", None):
+        if torch_mod.backends.mps.is_available():
+            return torch_mod.device("mps")
+    return torch_mod.device("cpu")
+
+
+def _ensure_hf_ocr():
+    global _HF_OCR_CACHE
+    if _HF_OCR_CACHE is not None:
+        return _HF_OCR_CACHE
+    try:
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "Falta instalar 'transformers' y 'torch' para el backend local. Ejecutá pip install -r requirements.txt."
+        ) from exc
+
+    model_name = os.environ.get("HF_OCR_MODEL", "microsoft/trocr-base-printed")
+    print(f"[OCR] Cargando modelo local {model_name}...", flush=True)
+    processor = TrOCRProcessor.from_pretrained(model_name)
+    model = VisionEncoderDecoderModel.from_pretrained(model_name)
+    device = _resolve_hf_device(torch)
+    model.to(device)
+    model.eval()
+    _HF_OCR_CACHE = {
+        "processor": processor,
+        "model": model,
+        "device": device,
+        "torch": torch,
+    }
+    return _HF_OCR_CACHE
+
+
+def parse_bcra_image_with_huggingface(img_path: Path) -> dict:
+    """OCR local usando TrOCR + parseo por regex."""
+    cache = _ensure_hf_ocr()
+    processor = cache["processor"]
+    model = cache["model"]
+    device = cache["device"]
+    torch_mod = cache["torch"]
+
+    image = Image.open(img_path).convert("RGB")
+    pixel_values = processor(images=image, return_tensors="pt").pixel_values.to(device)
+
+    with torch_mod.no_grad():
+        generated_ids = model.generate(pixel_values, max_length=256)
+
+    texto = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    if not texto.strip():
+        raise RuntimeError("OCR local no devolvió texto.")
+    return parse_bcra_text_to_json(texto)
+
+
+# =========================================================
+# === SELECCIÓN DE BACKEND OCR ============================
+# =========================================================
+
+def _normalize_backend_name(name: str) -> str | None:
+    if not name:
+        return None
+    lowered = name.lower().strip()
+    if lowered in {"hf", "huggingface", "local"}:
+        return "huggingface"
+    if lowered in {"openai", "gpt"}:
+        return "openai"
+    return None
+
+
+def _preferred_backend_order() -> list:
+    env_value = os.environ.get("BCRA_OCR_BACKEND", "huggingface")
+    requested = [v.strip() for v in env_value.split(",") if v.strip()]
+
+    order = []
+    for candidate in requested + DEFAULT_OCR_BACKENDS:
+        normalized = _normalize_backend_name(candidate)
+        if normalized and normalized not in order:
+            order.append(normalized)
+    return order or DEFAULT_OCR_BACKENDS
+
+
+def parse_bcra_image(img_path: Path) -> dict:
+    """Intenta parsear la imagen usando backends en orden preferido."""
+    errors = []
+    for backend in _preferred_backend_order():
+        try:
+            print(f"[OCR] Intentando backend '{backend}'...", flush=True)
+            if backend == "huggingface":
+                return parse_bcra_image_with_huggingface(img_path)
+            if backend == "openai":
+                return parse_bcra_image_with_openai(img_path)
+        except Exception as exc:
+            errors.append(f"{backend}: {exc}")
+            print(f"[OCR] ⚠ Backend '{backend}' falló: {exc}", file=sys.stderr, flush=True)
+            continue
+
+    raise RuntimeError("Ningún backend OCR funcionó. Errores: " + " | ".join(errors))
 
 
 
@@ -297,8 +510,8 @@ def main():
 
     img_path = download_bcra_image()
 
-    print("=== Enviando imagen a OpenAI para parseo ===", flush=True)
-    parsed = parse_bcra_image_with_openai(img_path)
+    print("=== Parseando imagen (backends locales → OpenAI fallback) ===", flush=True)
+    parsed = parse_bcra_image(img_path)
     print("JSON parseado:", flush=True)
     print(json.dumps(parsed, indent=2, ensure_ascii=False), flush=True)
 
