@@ -1,10 +1,9 @@
-# bcra_daily_parser.py
-import os, json, base64, requests, re
+import os, json, requests, re, argparse
+from urllib.parse import unquote
 import sys, traceback
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from openai import OpenAI
 from PIL import Image
 
 from sqlalchemy import create_engine, text
@@ -12,95 +11,401 @@ from sqlalchemy.engine import Engine
 
 # --- Config global ---
 BA_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
-X_API_BASE = "https://api.twitter.com/2"
 USERNAME = "BancoCentral_AR"
 SAVE_DIR = Path("./bcra_imagenes")
-CACHE_FILE = Path(".bcra_x_cache.json")
-DEFAULT_OCR_BACKENDS = ["huggingface", "openai"]
-_HF_OCR_CACHE = None
+REQUIRED_HASHTAGS = ("#databcra", "#reservasbcra")
+
+_COOKIE_HEADER_KEYS = {
+    "authorization",
+    "Authorization",
+    "user-agent",
+    "x-twitter-auth-type",
+    "x-twitter-active-user",
+    "x-twitter-client-language",
+}
 
 
-# =========================================================
-# === FUNCIONES DE X.COM =================================
-# =========================================================
+def _read_cookies_file(path: Path) -> dict:
+    if not path.exists():
+        raise RuntimeError(f"No se encontró el archivo de cookies en {path}")
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        raise RuntimeError(f"No pude parsear {path} como JSON de cookies.") from exc
+    return data
 
-def auth_headers() -> dict:
-    token = os.getenv("X_BEARER_TOKEN")
-    if not token:
-        raise RuntimeError("Falta X_BEARER_TOKEN en el entorno.")
-    return {"Authorization": f"Bearer {token}"}
+
+def _cookies_to_headers(cookies: dict) -> dict:
+    auth = cookies.get("authorization") or cookies.get("Authorization")
+    if not auth:
+        raise RuntimeError("Las cookies no incluyen el header 'authorization'.")
+    ct0 = cookies.get("ct0")
+    if not ct0:
+        raise RuntimeError("Las cookies no incluyen 'ct0'.")
+
+    if "%3D" in auth or "%2F" in auth or "%2B" in auth:
+        auth = unquote(auth)
+
+    headers = {
+        "Authorization": auth if auth.startswith("Bearer ") else f"Bearer {auth}",
+        "x-csrf-token": ct0,
+        "x-twitter-auth-type": cookies.get("x-twitter-auth-type", "OAuth2Session"),
+        "x-twitter-active-user": cookies.get("x-twitter-active-user", "yes"),
+        "x-twitter-client-language": cookies.get("x-twitter-client-language", "en"),
+        "User-Agent": cookies.get(
+            "user-agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        ),
+        "Referer": "https://x.com/",
+        "Origin": "https://x.com",
+    }
+    guest_token = cookies.get("gt") or cookies.get("guest_token")
+    if guest_token:
+        headers["x-guest-token"] = str(guest_token)
+    return headers
+
 
 def ba_today():
     return datetime.now(BA_TZ).date()
 
-def is_today_ba(iso_ts: str) -> bool:
-    dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).astimezone(BA_TZ)
-    return dt.date() == ba_today()
 
-def matches_signature(text: str) -> bool:
-    t = text.lower()
-    return "#databcra" in t  # laxo pero suficiente
+def _parse_target_date(value: str | None):
+    if not value:
+        return ba_today()
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise RuntimeError("La fecha objetivo debe tener formato YYYY-MM-DD.") from exc
 
-def get_user_id(username: str) -> str:
-    if CACHE_FILE.exists():
-        cache = json.loads(CACHE_FILE.read_text())
-        if cache.get("username") == username and "user_id" in cache:
-            return cache["user_id"]
 
-    url = f"{X_API_BASE}/users/by/username/{username}"
-    r = requests.get(url, headers=auth_headers(), timeout=30)
-    r.raise_for_status()
-    user_id = r.json()["data"]["id"]
-    CACHE_FILE.write_text(json.dumps({"username": username, "user_id": user_id}))
-    return user_id
+def _cookie_domains() -> list[str]:
+    custom = os.environ.get("X_COOKIE_DOMAIN")
+    domains: list[str] = []
+    if custom:
+        domains.append(custom)
+    for default_domain in [".x.com", ".twitter.com"]:
+        if default_domain not in domains:
+            domains.append(default_domain)
+    return domains
 
-def download_bcra_image() -> Path:
-    """Descarga la imagen diaria del tweet #DataBCRA."""
+
+def _cookies_to_playwright_list(cookies: dict) -> list[dict]:
+    cookie_values = {k: v for k, v in cookies.items() if k not in _COOKIE_HEADER_KEYS}
+    result = []
+    for domain in _cookie_domains():
+        for name, value in cookie_values.items():
+            if value is None:
+                continue
+            result.append(
+                {
+                    "name": str(name),
+                    "value": str(value),
+                    "domain": domain,
+                    "path": "/",
+                    "secure": True,
+                }
+            )
+    return result
+
+
+def _resolve_cookies_file() -> Path:
+    env_path = os.environ.get("X_COOKIES_FILE")
+    if env_path:
+        return Path(env_path).expanduser()
+    return Path("cookies.json")
+
+
+def _normalize_tweet_date(iso_ts: str) -> str:
+    try:
+        return datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).date().isoformat()
+    except Exception:
+        return ""
+
+
+def _build_search_query(target_date) -> str:
+    since = target_date.isoformat()
+    until = (target_date + timedelta(days=1)).isoformat()
+    return (
+        f"from:{USERNAME} {REQUIRED_HASHTAGS[0]} {REQUIRED_HASHTAGS[1]} "
+        f"filter:images since:{since} until:{until}"
+    )
+
+
+def _collect_status_urls(page) -> list[str]:
+    urls: list[str] = []
+    try:
+        anchors = page.locator('a[href*="/status/"]')
+        count = anchors.count()
+        for idx in range(min(count, 60)):
+            href = anchors.nth(idx).get_attribute("href")
+            if not href:
+                continue
+            if href.startswith("/"):
+                href = f"https://x.com{href}"
+            if href not in urls:
+                urls.append(href)
+    except Exception:
+        return urls
+    return urls
+
+
+def _fetch_image_from_status_urls(context, status_urls: list[str], target_date) -> str:
+    target_iso = target_date.isoformat()
+    for url in status_urls[:25]:
+        page = context.new_page()
+        try:
+            page.set_default_timeout(60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            if "/i/flow/login" in page.url or "/login" in page.url:
+                continue
+            time_el = page.locator("time")
+            if time_el.count() == 0:
+                continue
+            iso_ts = time_el.first.get_attribute("datetime") or ""
+            if _normalize_tweet_date(iso_ts) != target_iso:
+                continue
+            text = ""
+            try:
+                text = (page.locator("article").first.inner_text() or "").lower()
+            except Exception:
+                text = ""
+            if text and not all(tag in text for tag in REQUIRED_HASHTAGS):
+                continue
+            meta_img = page.locator('meta[property="og:image"]')
+            if meta_img.count() > 0:
+                src = meta_img.first.get_attribute("content")
+                if src:
+                    if "name=" in src:
+                        src = re.sub(r"name=[a-z]+", "name=large", src)
+                    return src
+            img = page.locator("img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
+            if img.count() > 0:
+                src = img.first.get_attribute("src")
+                if src:
+                    if "name=" in src:
+                        src = re.sub(r"name=[a-z]+", "name=large", src)
+                    return src
+        finally:
+            page.close()
+    raise RuntimeError("No encontré imagen navegando a statuses desde perfil/media.")
+
+
+def _fetch_image_url_with_playwright_search(context, target_date) -> str:
+    query = _build_search_query(target_date)
+    search_urls = [
+        f"https://x.com/search?q={requests.utils.quote(query)}&f=live",
+        f"https://x.com/search?q={requests.utils.quote(query)}&src=typed_query",
+        f"https://x.com/search?q={requests.utils.quote(query)}&f=top",
+    ]
+    page = context.new_page()
+    try:
+        page.set_default_timeout(60000)
+        for search_url in search_urls:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+            if "/i/flow/login" in page.url or "/login" in page.url:
+                raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
+            candidates = page.locator("article, div[data-testid='cellInnerDiv']")
+            for _ in range(6):
+                if candidates.count() == 0:
+                    page.wait_for_timeout(1500)
+                    page.mouse.wheel(0, 1200)
+                    continue
+                status_urls = _collect_status_urls(page)
+                if status_urls:
+                    try:
+                        return _fetch_image_from_status_urls(context, status_urls, target_date)
+                    except Exception:
+                        pass
+                page.mouse.wheel(0, 1200)
+                page.wait_for_timeout(1500)
+        title = ""
+        try:
+            title = page.title()
+        except Exception:
+            title = ""
+        raise RuntimeError(
+            f"No encontré imagen en búsqueda. url={page.url} title={title}"
+        )
+    finally:
+        page.close()
+
+
+def _fetch_image_url_with_playwright_profile(context, target_date) -> str:
+    profile_url = f"https://x.com/{USERNAME}"
+    page = context.new_page()
+    try:
+        page.set_default_timeout(60000)
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=60000)
+        except Exception:
+            pass
+        if "/i/flow/login" in page.url or "/login" in page.url:
+            raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
+        target_iso = target_date.isoformat()
+        candidates = page.locator("article, div[data-testid='cellInnerDiv']")
+        for _ in range(8):
+            if candidates.count() == 0:
+                page.wait_for_timeout(1500)
+                page.mouse.wheel(0, 1400)
+                continue
+            for idx in range(candidates.count()):
+                try:
+                    node = candidates.nth(idx)
+                    time_el = node.locator("time")
+                    if time_el.count() == 0:
+                        continue
+                    iso_ts = time_el.first.get_attribute("datetime") or ""
+                    if _normalize_tweet_date(iso_ts) != target_iso:
+                        continue
+                    text = ""
+                    try:
+                        text = (node.inner_text() or "").lower()
+                    except Exception:
+                        text = ""
+                    if text and not all(tag in text for tag in REQUIRED_HASHTAGS):
+                        continue
+                    img = node.locator("img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
+                    if img.count() == 0:
+                        continue
+                    src = img.first.get_attribute("src")
+                    if not src:
+                        continue
+                    if "name=" in src:
+                        src = re.sub(r"name=[a-z]+", "name=large", src)
+                    return src
+                except Exception:
+                    continue
+            page.mouse.wheel(0, 1400)
+            page.wait_for_timeout(1500)
+        title = ""
+        try:
+            title = page.title()
+        except Exception:
+            title = ""
+        raise RuntimeError(
+            f"No encontré imagen en perfil. url={page.url} title={title}"
+        )
+    finally:
+        page.close()
+
+
+def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
+    media_url = f"https://x.com/{USERNAME}/media"
+    page = context.new_page()
+    try:
+        page.set_default_timeout(60000)
+        page.goto(media_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=60000)
+        except Exception:
+            pass
+        if "/i/flow/login" in page.url or "/login" in page.url:
+            raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
+        target_iso = target_date.isoformat()
+        candidates = page.locator("article, div[data-testid='cellInnerDiv']")
+        for _ in range(8):
+            if candidates.count() == 0:
+                page.wait_for_timeout(1500)
+                page.mouse.wheel(0, 1400)
+                continue
+            for idx in range(candidates.count()):
+                try:
+                    node = candidates.nth(idx)
+                    time_el = node.locator("time")
+                    if time_el.count() == 0:
+                        continue
+                    iso_ts = time_el.first.get_attribute("datetime") or ""
+                    if _normalize_tweet_date(iso_ts) != target_iso:
+                        continue
+                    img = node.locator("img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
+                    if img.count() == 0:
+                        continue
+                    src = img.first.get_attribute("src")
+                    if not src:
+                        continue
+                    if "name=" in src:
+                        src = re.sub(r"name=[a-z]+", "name=large", src)
+                    return src
+                except Exception:
+                    continue
+            page.mouse.wheel(0, 1400)
+            page.wait_for_timeout(1500)
+        status_urls = _collect_status_urls(page)
+        try:
+            return _fetch_image_from_status_urls(context, status_urls, target_date)
+        except Exception:
+            pass
+        title = ""
+        try:
+            title = page.title()
+        except Exception:
+            title = ""
+        raise RuntimeError(
+            f"No encontré imagen en perfil/media. url={page.url} title={title}"
+        )
+    finally:
+        page.close()
+
+
+def _fetch_image_url_with_playwright(cookies_path: Path, target_date) -> str:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Falta instalar Playwright. Ejecutá: pip install playwright && playwright install"
+        ) from exc
+
+    cookies = _read_cookies_file(cookies_path)
+    headers = _cookies_to_headers(cookies)
+    pw_cookies = _cookies_to_playwright_list(cookies)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=headers.get("User-Agent"),
+            locale="es-ES",
+            timezone_id="America/Argentina/Buenos_Aires",
+        )
+        try:
+            if pw_cookies:
+                context.add_cookies(pw_cookies)
+            page_headers = {
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "accept-language": "es-ES,es;q=0.9,en;q=0.8",
+                "upgrade-insecure-requests": "1",
+            }
+            context.set_extra_http_headers(page_headers)
+
+            # Try profile/media first, then search, then profile
+            try:
+                return _fetch_image_url_with_playwright_profile_media(context, target_date)
+            except Exception:
+                pass
+            try:
+                return _fetch_image_url_with_playwright_search(context, target_date)
+            except Exception:
+                pass
+            return _fetch_image_url_with_playwright_profile(context, target_date)
+        finally:
+            context.close()
+            browser.close()
+
+
+def download_bcra_image(target_date) -> Path:
+    """Descarga la imagen del tweet #DataBCRA para la fecha indicada."""
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    fname = f"bcra_{ba_today().isoformat()}.jpg"
+    fname = f"bcra_{target_date.isoformat()}.jpg"
     out_path = SAVE_DIR / fname
 
-    # Si ya existe la imagen de hoy, reutilizarla para evitar golpear la API.
+    # Si ya existe la imagen, reutilizarla
     if out_path.exists() and out_path.stat().st_size > 0:
         print(f"♻️ Imagen ya descargada, reusando: {out_path}", flush=True)
         return out_path
 
-    user_id = get_user_id(USERNAME)
-
-    url = f"{X_API_BASE}/users/{user_id}/tweets"
-    params = {
-        "max_results": "10",
-        "tweet.fields": "created_at,text,attachments",
-        "expansions": "attachments.media_keys",
-        "media.fields": "url,type"
-    }
-    r = requests.get(url, headers=auth_headers(), params=params, timeout=30)
-    r.raise_for_status()
-    payload = r.json()
-
-    tweets = payload.get("data", [])
-    media_index = {m["media_key"]: m for m in payload.get("includes", {}).get("media", [])}
-
-    chosen = None
-    for tw in tweets:
-        if not is_today_ba(tw.get("created_at", "")):
-            continue
-        if not matches_signature(tw.get("text", "")):
-            continue
-        media_keys = tw.get("attachments", {}).get("media_keys", [])
-        photos = [
-            media_index[mk]["url"]
-            for mk in media_keys
-            if mk in media_index and media_index[mk].get("type") == "photo" and media_index[mk].get("url")
-        ]
-        if photos:
-            chosen = {"tweet": tw, "photos": photos}
-            break
-
-    if not chosen:
-        raise RuntimeError("No encontré tuit de HOY con #DataBCRA y foto.")
-
-    img_url = chosen["photos"][0]
+    print("[SCRAPER] Descargando imagen vía Playwright...", flush=True)
+    cookies_path = _resolve_cookies_file()
+    img_url = _fetch_image_url_with_playwright(cookies_path, target_date)
 
     ir = requests.get(img_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
     ir.raise_for_status()
@@ -108,67 +413,6 @@ def download_bcra_image() -> Path:
 
     print(f"✅ Imagen descargada: {out_path}", flush=True)
     return out_path
-
-
-# =========================================================
-# === FUNCIONES DE PARSEO CON OPENAI ======================
-# =========================================================
-
-def get_base_dir() -> Path:
-    """
-    Devuelve el directorio base donde buscar recursos (prompt.txt).
-    - En modo normal: el directorio del .py
-    - En modo PyInstaller (frozen): el directorio del ejecutable
-    """
-    if getattr(sys, "frozen", False):
-        # Ejecutable de PyInstaller
-        return Path(sys.executable).resolve().parent
-    # Ejecución normal
-    return Path(__file__).resolve().parent
-
-def parse_bcra_image_with_openai(img_path: Path) -> dict:
-    """Envía la imagen a OpenAI y devuelve el JSON estructurado."""
-    client = OpenAI()  # usa OPENAI_API_KEY del entorno
-
-    # detectar tipo MIME
-    ext = img_path.suffix.lower()
-    mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
-
-    # convertir a base64
-    b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
-    data_url = f"data:{mime};base64,{b64}"
-
-    # --- cargar prompt desde archivo prompt.txt al lado del ejecutable / script ---
-    base_dir = get_base_dir()
-    prompt_file = base_dir / "prompt.txt"
-
-    if not prompt_file.exists():
-        raise FileNotFoundError(f"No se encontró prompt.txt en {prompt_file}")
-
-    prompt = prompt_file.read_text(encoding="utf-8").strip()
-
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "Sos un extractor que devuelve JSON válido y nada más."},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            },
-        ],
-    )
-
-    out = resp.choices[0].message.content.strip()
-    try:
-        data = json.loads(out)
-    except Exception:
-        raise RuntimeError(f"No se recibió JSON válido: {out}")
-    return data
 
 
 # =========================================================
@@ -180,14 +424,36 @@ _DATE_PATTERNS = [
     (re.compile(r"\b(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})\b"), "ymd"),
 ]
 
+_SPANISH_MONTHS = {
+    'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4, 'mayo': 5, 'junio': 6,
+    'julio': 7, 'agosto': 8, 'septiembre': 9, 'octubre': 10, 'noviembre': 11, 'diciembre': 12
+}
+
 
 def _normalize_number_es(raw: str) -> float:
-    """Convierte números estilo ES/EN (1.716,5 / 1,716.5 / 1716) a float."""
+    """Convierte números estilo ES (44.607 / 1.453,446) a float.
+
+    Reglas:
+    - Si hay coma y punto: punto=miles, coma=decimal (1.453,446 -> 1453.446)
+    - Si solo hay punto seguido de exactamente 3 dígitos: punto=miles (44.607 -> 44607)
+    - Si solo hay coma: coma=decimal (39,69 -> 39.69)
+    - Si solo hay punto NO seguido de 3 dígitos: punto=decimal (44.5 -> 44.5)
+    """
     cleaned = re.sub(r"[^\d,.\-]", "", raw.strip())
+
     if "," in cleaned and "." in cleaned:
+        # Ambos: punto=miles, coma=decimal
         cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "." in cleaned and "," not in cleaned:
+        # Solo punto: verificar si es separador de miles (seguido de exactamente 3 dígitos)
+        if re.match(r"^-?\d{1,3}(\.\d{3})+$", cleaned):
+            # Es separador de miles: 44.607 -> 44607
+            cleaned = cleaned.replace(".", "")
+        # Si no, es decimal y lo dejamos como está
     elif "," in cleaned and "." not in cleaned:
+        # Solo coma: es decimal
         cleaned = cleaned.replace(",", ".")
+
     try:
         return float(cleaned)
     except Exception:
@@ -196,6 +462,18 @@ def _normalize_number_es(raw: str) -> float:
 
 def _extract_fecha(texto: str) -> str:
     """Devuelve fecha yyyy-mm-dd encontrada en el texto; fallback: hoy BA."""
+    # Primero intentar formato español: "16 DE ENERO DE 2026"
+    m_es = re.search(r"(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})", texto, re.IGNORECASE)
+    if m_es:
+        day_str, month_name, year_str = m_es.groups()
+        month_num = _SPANISH_MONTHS.get(month_name.lower())
+        if month_num:
+            try:
+                return datetime(int(year_str), month_num, int(day_str)).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
+    # Luego intentar formatos numéricos: dd/mm/yyyy o yyyy-mm-dd
     for rx, fmt in _DATE_PATTERNS:
         match = rx.search(texto)
         if not match:
@@ -208,6 +486,7 @@ def _extract_fecha(texto: str) -> str:
             return datetime(y, mth, d).strftime("%Y-%m-%d")
         except ValueError:
             continue
+
     return ba_today().strftime("%Y-%m-%d")
 
 
@@ -219,6 +498,8 @@ def _clean_text(texto: str) -> str:
 def parse_bcra_text_to_json(texto_ocr: str) -> dict:
     """
     Parsea el texto OCR y devuelve {fecha, reservas_millones_usd, compra_venta_divisas_millones_usd}.
+    Maneja tanto el formato donde el número viene ANTES del label (Tesseract)
+    como el formato donde viene DESPUÉS.
     """
     texto = _clean_text(texto_ocr)
     low = texto.lower()
@@ -226,17 +507,20 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
     fecha = _extract_fecha(texto)
 
     reservas = None
-    m_res = re.search(r"(reserva\w*.*?)([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
-    if m_res:
+    # Patrón 1: número ANTES de "reservas" (layout típico de Tesseract)
+    m_res_before = re.search(r"([\d\.,]+)\s*\n?\s*reservas", low, flags=re.IGNORECASE)
+    if m_res_before:
         try:
-            reservas = _normalize_number_es(m_res.group(2))
+            reservas = _normalize_number_es(m_res_before.group(1))
         except Exception:
             reservas = None
+
+    # Patrón 2: "reservas" seguido de número
     if reservas is None:
-        around = re.search(r"rese\w+.{0,40}?([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
-        if around:
+        m_res_after = re.search(r"reserva\w*.*?([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
+        if m_res_after:
             try:
-                reservas = _normalize_number_es(around.group(1))
+                reservas = _normalize_number_es(m_res_after.group(1))
             except Exception:
                 reservas = None
 
@@ -244,17 +528,20 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
     if "sin intervención" in low or "sin intervencion" in low:
         compra_venta = 0.0
     else:
-        m_cv = re.search(r"(compra|venta|intervenci[oó]n|mulc)\D{0,40}([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
-        if m_cv:
+        # Patrón 1: número ANTES de "compra" (layout típico de Tesseract)
+        m_cv_before = re.search(r"([-+]?\s*[\d\.,]+)\s*\n?\s*compra", low, flags=re.IGNORECASE)
+        if m_cv_before:
             try:
-                compra_venta = _normalize_number_es(m_cv.group(2))
+                compra_venta = _normalize_number_es(m_cv_before.group(1))
             except Exception:
                 compra_venta = 0.0
-        else:
-            m_any = re.search(r"([-+]\s*[\d\.,]+)\s*(m|millones|usd|u\$s|us\$|d[oó]lares)", texto, flags=re.IGNORECASE)
-            if m_any:
+
+        # Patrón 2: "compra/venta" seguido de número
+        if compra_venta == 0.0:
+            m_cv_after = re.search(r"(compra|venta|intervenci[oó]n|mulc)\D{0,40}([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
+            if m_cv_after:
                 try:
-                    compra_venta = _normalize_number_es(m_any.group(1))
+                    compra_venta = _normalize_number_es(m_cv_after.group(2))
                 except Exception:
                     compra_venta = 0.0
 
@@ -269,111 +556,27 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
 
 
 # =========================================================
-# === OCR LOCAL CON HUGGING FACE ==========================
+# === OCR CON TESSERACT ===================================
 # =========================================================
-
-def _resolve_hf_device(torch_mod):
-    preference = os.environ.get("HF_OCR_DEVICE", "cpu").lower()
-    if preference == "cuda" and torch_mod.cuda.is_available():
-        return torch_mod.device("cuda")
-    if preference == "mps" and getattr(torch_mod.backends, "mps", None):
-        if torch_mod.backends.mps.is_available():
-            return torch_mod.device("mps")
-    return torch_mod.device("cpu")
-
-
-def _ensure_hf_ocr():
-    global _HF_OCR_CACHE
-    if _HF_OCR_CACHE is not None:
-        return _HF_OCR_CACHE
-    try:
-        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-        import torch
-    except ImportError as exc:
-        raise RuntimeError(
-            "Falta instalar 'transformers' y 'torch' para el backend local. Ejecutá pip install -r requirements.txt."
-        ) from exc
-
-    model_name = os.environ.get("HF_OCR_MODEL", "microsoft/trocr-base-printed")
-    print(f"[OCR] Cargando modelo local {model_name}...", flush=True)
-    processor = TrOCRProcessor.from_pretrained(model_name)
-    model = VisionEncoderDecoderModel.from_pretrained(model_name)
-    device = _resolve_hf_device(torch)
-    model.to(device)
-    model.eval()
-    _HF_OCR_CACHE = {
-        "processor": processor,
-        "model": model,
-        "device": device,
-        "torch": torch,
-    }
-    return _HF_OCR_CACHE
-
-
-def parse_bcra_image_with_huggingface(img_path: Path) -> dict:
-    """OCR local usando TrOCR + parseo por regex."""
-    cache = _ensure_hf_ocr()
-    processor = cache["processor"]
-    model = cache["model"]
-    device = cache["device"]
-    torch_mod = cache["torch"]
-
-    image = Image.open(img_path).convert("RGB")
-    pixel_values = processor(images=image, return_tensors="pt").pixel_values.to(device)
-
-    with torch_mod.no_grad():
-        generated_ids = model.generate(pixel_values, max_length=256)
-
-    texto = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    if not texto.strip():
-        raise RuntimeError("OCR local no devolvió texto.")
-    return parse_bcra_text_to_json(texto)
-
-
-# =========================================================
-# === SELECCIÓN DE BACKEND OCR ============================
-# =========================================================
-
-def _normalize_backend_name(name: str) -> str | None:
-    if not name:
-        return None
-    lowered = name.lower().strip()
-    if lowered in {"hf", "huggingface", "local"}:
-        return "huggingface"
-    if lowered in {"openai", "gpt"}:
-        return "openai"
-    return None
-
-
-def _preferred_backend_order() -> list:
-    env_value = os.environ.get("BCRA_OCR_BACKEND", "huggingface")
-    requested = [v.strip() for v in env_value.split(",") if v.strip()]
-
-    order = []
-    for candidate in requested + DEFAULT_OCR_BACKENDS:
-        normalized = _normalize_backend_name(candidate)
-        if normalized and normalized not in order:
-            order.append(normalized)
-    return order or DEFAULT_OCR_BACKENDS
-
 
 def parse_bcra_image(img_path: Path) -> dict:
-    """Intenta parsear la imagen usando backends en orden preferido."""
-    errors = []
-    for backend in _preferred_backend_order():
-        try:
-            print(f"[OCR] Intentando backend '{backend}'...", flush=True)
-            if backend == "huggingface":
-                return parse_bcra_image_with_huggingface(img_path)
-            if backend == "openai":
-                return parse_bcra_image_with_openai(img_path)
-        except Exception as exc:
-            errors.append(f"{backend}: {exc}")
-            print(f"[OCR] ⚠ Backend '{backend}' falló: {exc}", file=sys.stderr, flush=True)
-            continue
+    """OCR usando Tesseract + parseo por regex."""
+    try:
+        import pytesseract
+    except ImportError as exc:
+        raise RuntimeError(
+            "Falta instalar 'pytesseract'. Ejecutá: pip install pytesseract"
+        ) from exc
 
-    raise RuntimeError("Ningún backend OCR funcionó. Errores: " + " | ".join(errors))
+    print("[OCR] Ejecutando Tesseract...", flush=True)
+    image = Image.open(img_path).convert("RGB")
+    texto = pytesseract.image_to_string(image, lang='spa+eng')
 
+    if not texto.strip():
+        raise RuntimeError("Tesseract no devolvió texto.")
+
+    print(f"[OCR] Texto extraído ({len(texto)} chars)", flush=True)
+    return parse_bcra_text_to_json(texto)
 
 
 # =========================================================
@@ -393,14 +596,12 @@ def build_engine() -> Engine:
     print(f"[DB] Conectando a Postgres host={db_host} port={db_port} db={db_name} user={db_user}", flush=True)
     DATABASE_URL = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
-    # Sumar pre_ping y timeout
     engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 
-    # Verificación temprana de conexión para loguear errores en el acto
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        print("[DB] ✔ Conexión a Postgres verificada (SELECT 1)", flush=True)
+        print("[DB] ✔ Conexión a Postgres verificada", flush=True)
     except Exception as e:
         print(f"[DB] ❌ Error conectando a Postgres: {e}", file=sys.stderr)
         traceback.print_exc()
@@ -408,14 +609,9 @@ def build_engine() -> Engine:
 
     return engine
 
+
 def save_reservas_to_db(engine: Engine, parsed: dict) -> int:
-    """
-    Inserta en la tabla reservas_scrape (date, valor)
-    el valor 'reservas_millones_usd' que vino del JSON.
-    - date: parsed['fecha'] (yyyy-mm-dd)
-    - valor: float
-    Devuelve la cantidad de filas insertadas (1 si OK).
-    """
+    """Inserta en la tabla reservas_scrape (date, valor)."""
     fecha = parsed.get("fecha")
     valor = parsed.get("reservas_millones_usd", None)
 
@@ -424,13 +620,11 @@ def save_reservas_to_db(engine: Engine, parsed: dict) -> int:
     if valor is None:
         raise ValueError("El JSON no trae 'reservas_millones_usd'.")
 
-    # Validar formato de fecha
     try:
         _ = datetime.strptime(fecha, "%Y-%m-%d").date()
     except Exception:
         raise ValueError(f"Fecha inválida: {fecha}")
 
-    # Forzar float
     try:
         valor = float(valor)
     except Exception:
@@ -450,40 +644,33 @@ def save_reservas_to_db(engine: Engine, parsed: dict) -> int:
             print(f"[DB] reservas_scrape rowcount={rc}", flush=True)
             return rc
         except Exception as e:
-            print(f"[DB] ❌ Error insertando en reservas_scrape: fecha={fecha} valor={valor} -> {e}", file=sys.stderr)
+            print(f"[DB] ❌ Error insertando en reservas_scrape: {e}", file=sys.stderr)
             traceback.print_exc()
             raise
 
+
 def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
-    """
-    Inserta en la tabla "comprasMULCBCRA" (date, "comprasBCRA")
-    el valor 'compra_venta_divisas_millones_usd' que vino del JSON.
-    - date: parsed['fecha'] (yyyy-mm-dd)
-    - "comprasBCRA": float (0.0 si no vino)
-    Devuelve la cantidad de filas insertadas (1 si OK).
-    """
-    fecha = parsed.get("fecha")  # 'yyyy-mm-dd'
+    """Inserta en la tabla comprasMULCBCRA2 (date, comprasBCRA)."""
+    fecha = parsed.get("fecha")
     valor = parsed.get("compra_venta_divisas_millones_usd", 0.0)
 
     if not fecha:
         raise ValueError("El JSON no trae 'fecha'.")
 
     try:
-        # Validación básica de formato (yyyy-mm-dd)
         _ = datetime.strptime(fecha, "%Y-%m-%d").date()
     except Exception:
         raise ValueError(f"Fecha inválida: {fecha}")
 
-    # Forzar float
     try:
         valor = float(valor)
     except Exception:
         raise ValueError(f"Valor de compra_venta_divisas_millones_usd inválido: {valor}")
 
-    print(f"[DB] Upsert comprasMULCBCRA fecha={fecha} valor={valor}", flush=True)
+    print(f"[DB] Upsert comprasMULCBCRA2 fecha={fecha} valor={valor}", flush=True)
 
     insert_sql = text("""
-        INSERT INTO "public"."comprasMULCBCRA" (date, "comprasBCRA")
+        INSERT INTO "public"."comprasMULCBCRA2" (date, "comprasBCRA")
         VALUES (:fecha, :valor)
         ON CONFLICT (date) DO UPDATE SET "comprasBCRA" = EXCLUDED."comprasBCRA";
     """)
@@ -492,25 +679,32 @@ def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
         try:
             res = conn.execute(insert_sql, {"fecha": fecha, "valor": valor})
             rc = res.rowcount if (res.rowcount is not None and res.rowcount >= 0) else 1
-            print(f"[DB] comprasMULCBCRA rowcount={rc}", flush=True)
+            print(f"[DB] comprasMULCBCRA2 rowcount={rc}", flush=True)
             return rc
         except Exception as e:
-            print(f"[DB] ❌ Error upsert en comprasMULCBCRA: fecha={fecha} valor={valor} -> {e}", file=sys.stderr)
+            print(f"[DB] ❌ Error upsert en comprasMULCBCRA2: {e}", file=sys.stderr)
             traceback.print_exc()
             raise
 
 
 # =========================================================
-# === MAIN ===============================================
+# === MAIN ================================================
 # =========================================================
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--target-date",
+        help="Fecha objetivo en formato YYYY-MM-DD (default: hoy en Buenos Aires).",
+        default=None,
+    )
+    args = parser.parse_args()
+    target_date = _parse_target_date(args.target_date)
+
     print("=== Descargando imagen del BCRA desde X ===", flush=True)
-    print(f"[RUN] CWD: {Path.cwd()}", flush=True)
+    img_path = download_bcra_image(target_date)
 
-    img_path = download_bcra_image()
-
-    print("=== Parseando imagen (backends locales → OpenAI fallback) ===", flush=True)
+    print("=== Parseando imagen con Tesseract ===", flush=True)
     parsed = parse_bcra_image(img_path)
     print("JSON parseado:", flush=True)
     print(json.dumps(parsed, indent=2, ensure_ascii=False), flush=True)
@@ -518,25 +712,23 @@ def main():
     print("=== Guardando en Postgres ===", flush=True)
     try:
         engine = build_engine()
-        print("[DB] Engine construido OK", flush=True)
     except Exception:
         return
 
     try:
-        print("[DB] -> Guardando comprasMULCBCRA...", flush=True)
         n1 = save_compra_venta_to_db(engine, parsed)
-        print(f"✅ Inserted {n1} rows into \"comprasMULCBCRA\"", flush=True)
+        print(f"✅ Inserted {n1} rows into comprasMULCBCRA2", flush=True)
     except Exception:
         return
 
     try:
-        print("[DB] -> Guardando reservas_scrape...", flush=True)
         n2 = save_reservas_to_db(engine, parsed)
         print(f"✅ Inserted {n2} rows into reservas_scrape", flush=True)
     except Exception:
         return
 
     print("=== Proceso finalizado ===", flush=True)
+
 
 if __name__ == "__main__":
     main()
