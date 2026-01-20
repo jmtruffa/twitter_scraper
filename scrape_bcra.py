@@ -567,6 +567,7 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
     else:
         # Patrón 1: número ANTES de "compra" (layout típico de Tesseract)
         m_cv_before = re.search(r"([-+]?\s*[\d\.,\]]+)\s+compra", low, flags=re.IGNORECASE)
+        print(f"[DEBUG] Match compra patrón 1 (antes): {m_cv_before}", flush=True)
         if m_cv_before:
             try:
                 compra_venta = _normalize_number_es(m_cv_before.group(1))
@@ -575,12 +576,28 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
 
         # Patrón 2: "compra/venta" seguido de número
         if compra_venta == 0.0:
-            m_cv_after = re.search(r"(compra|venta|intervenci[oó]n|mulc)\D{0,40}([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
+            m_cv_after = re.search(r"(compra|venta)\s+de\s+divisas\D{0,30}([-+]?\s*[\d\.,]+)", low, flags=re.IGNORECASE)
+            print(f"[DEBUG] Match compra patrón 2 (después): {m_cv_after}", flush=True)
             if m_cv_after:
                 try:
                     compra_venta = _normalize_number_es(m_cv_after.group(2))
                 except Exception:
                     compra_venta = 0.0
+
+        # Patrón 3: buscar número pequeño (1-500) que no sea año ni reservas
+        if compra_venta == 0.0:
+            all_numbers = re.findall(r"[\d\.,]+", low)
+            print(f"[DEBUG] Buscando compra en números: {all_numbers}", flush=True)
+            for num_str in all_numbers:
+                try:
+                    val = _normalize_number_es(num_str)
+                    # Compra/venta suele ser < 500 millones, no es año (>2000), no es reservas (>10000)
+                    if 1 <= val <= 500 and val != 19:  # 19 es el día
+                        compra_venta = val
+                        print(f"[DEBUG] Compra (patrón 3 - número pequeño): {compra_venta}", flush=True)
+                        break
+                except Exception:
+                    continue
 
     if reservas is None:
         raise RuntimeError("No pude extraer 'reservas_millones_usd' del OCR.")
