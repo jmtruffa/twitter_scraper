@@ -508,6 +508,7 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
 
     reservas = None
     # Patrón 1: número ANTES de "reservas" (layout típico de Tesseract)
+    print(f"[DEBUG] Texto completo: {repr(low)}", flush=True)
     print(f"[DEBUG] Buscando en texto ({len(low)} chars)...", flush=True)
     m_res_before = re.search(r"([\d\.,]+)\s+reservas", low, flags=re.IGNORECASE)
     print(f"[DEBUG] Match reservas: {m_res_before}", flush=True)
