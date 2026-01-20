@@ -508,7 +508,7 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
 
     reservas = None
     # Patrón 1: número ANTES de "reservas" (layout típico de Tesseract)
-    m_res_before = re.search(r"([\d\.,]+)\s*\n?\s*reservas", low, flags=re.IGNORECASE)
+    m_res_before = re.search(r"([\d\.,]+)\s+reservas", low, flags=re.IGNORECASE)
     if m_res_before:
         try:
             reservas = _normalize_number_es(m_res_before.group(1))
@@ -529,7 +529,7 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
         compra_venta = 0.0
     else:
         # Patrón 1: número ANTES de "compra" (layout típico de Tesseract)
-        m_cv_before = re.search(r"([-+]?\s*[\d\.,]+)\s*\n?\s*compra", low, flags=re.IGNORECASE)
+        m_cv_before = re.search(r"([-+]?\s*[\d\.,\]]+)\s+compra", low, flags=re.IGNORECASE)
         if m_cv_before:
             try:
                 compra_venta = _normalize_number_es(m_cv_before.group(1))
