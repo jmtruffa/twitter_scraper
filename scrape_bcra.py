@@ -462,7 +462,7 @@ def _normalize_number_es(raw: str) -> float:
 
 def _extract_fecha(texto: str) -> str:
     """Devuelve fecha yyyy-mm-dd encontrada en el texto; fallback: hoy BA."""
-    # Primero intentar formato español: "16 DE ENERO DE 2026"
+    # Patrón 1: formato español limpio "16 DE ENERO DE 2026"
     m_es = re.search(r"(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})", texto, re.IGNORECASE)
     if m_es:
         day_str, month_name, year_str = m_es.groups()
@@ -473,7 +473,22 @@ def _extract_fecha(texto: str) -> str:
             except ValueError:
                 pass
 
-    # Luego intentar formatos numéricos: dd/mm/yyyy o yyyy-mm-dd
+    # Patrón 2: día de semana + número, luego "de [mes] de [año]" con basura en el medio
+    # Ej: "lunes 19 ... de enero de 2026"
+    m_weekday = re.search(r"(?:lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\s+(\d{1,2})", texto, re.IGNORECASE)
+    m_month_year = re.search(r"de\s+(\w+)\s+de\s+(\d{4})", texto, re.IGNORECASE)
+    if m_weekday and m_month_year:
+        day_str = m_weekday.group(1)
+        month_name = m_month_year.group(1)
+        year_str = m_month_year.group(2)
+        month_num = _SPANISH_MONTHS.get(month_name.lower())
+        if month_num:
+            try:
+                return datetime(int(year_str), month_num, int(day_str)).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
+    # Patrón 3: formatos numéricos dd/mm/yyyy o yyyy-mm-dd
     for rx, fmt in _DATE_PATTERNS:
         match = rx.search(texto)
         if not match:
@@ -675,7 +690,7 @@ def save_reservas_to_db(engine: Engine, parsed: dict) -> int:
 
 
 def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
-    """Inserta en la tabla comprasMULCBCRA2 (date, comprasBCRA)."""
+    """Inserta en la tabla comprasMULCBCRA (date, comprasBCRA)."""
     fecha = parsed.get("fecha")
     valor = parsed.get("compra_venta_divisas_millones_usd", 0.0)
 
@@ -692,10 +707,10 @@ def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
     except Exception:
         raise ValueError(f"Valor de compra_venta_divisas_millones_usd inválido: {valor}")
 
-    print(f"[DB] Upsert comprasMULCBCRA2 fecha={fecha} valor={valor}", flush=True)
+    print(f"[DB] Upsert comprasMULCBCRA fecha={fecha} valor={valor}", flush=True)
 
     insert_sql = text("""
-        INSERT INTO "public"."comprasMULCBCRA2" (date, "comprasBCRA")
+        INSERT INTO "public"."comprasMULCBCRA" (date, "comprasBCRA")
         VALUES (:fecha, :valor)
         ON CONFLICT (date) DO UPDATE SET "comprasBCRA" = EXCLUDED."comprasBCRA";
     """)
@@ -704,10 +719,10 @@ def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
         try:
             res = conn.execute(insert_sql, {"fecha": fecha, "valor": valor})
             rc = res.rowcount if (res.rowcount is not None and res.rowcount >= 0) else 1
-            print(f"[DB] comprasMULCBCRA2 rowcount={rc}", flush=True)
+            print(f"[DB] comprasMULCBCRA rowcount={rc}", flush=True)
             return rc
         except Exception as e:
-            print(f"[DB] ❌ Error upsert en comprasMULCBCRA2: {e}", file=sys.stderr)
+            print(f"[DB] ❌ Error upsert en comprasMULCBCRA: {e}", file=sys.stderr)
             traceback.print_exc()
             raise
 
@@ -742,7 +757,7 @@ def main():
 
     try:
         n1 = save_compra_venta_to_db(engine, parsed)
-        print(f"✅ Inserted {n1} rows into comprasMULCBCRA2", flush=True)
+        print(f"✅ Inserted {n1} rows into comprasMULCBCRA", flush=True)
     except Exception:
         return
 
