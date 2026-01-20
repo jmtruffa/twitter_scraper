@@ -462,10 +462,14 @@ def _normalize_number_es(raw: str) -> float:
 
 def _extract_fecha(texto: str) -> str:
     """Devuelve fecha yyyy-mm-dd encontrada en el texto; fallback: hoy BA."""
-    # Patrón 1: formato español limpio "16 DE ENERO DE 2026"
-    m_es = re.search(r"(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})", texto, re.IGNORECASE)
-    if m_es:
-        day_str, month_name, year_str = m_es.groups()
+    # Patrón 1: día de semana + número, luego "de [mes] de [año]" (más confiable)
+    # Ej: "lunes 19 ... de enero de 2026"
+    m_weekday = re.search(r"(?:lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\s+(\d{1,2})", texto, re.IGNORECASE)
+    m_month_year = re.search(r"de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+de\s+(\d{4})", texto, re.IGNORECASE)
+    if m_weekday and m_month_year:
+        day_str = m_weekday.group(1)
+        month_name = m_month_year.group(1)
+        year_str = m_month_year.group(2)
         month_num = _SPANISH_MONTHS.get(month_name.lower())
         if month_num:
             try:
@@ -473,14 +477,10 @@ def _extract_fecha(texto: str) -> str:
             except ValueError:
                 pass
 
-    # Patrón 2: día de semana + número, luego "de [mes] de [año]" con basura en el medio
-    # Ej: "lunes 19 ... de enero de 2026"
-    m_weekday = re.search(r"(?:lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\s+(\d{1,2})", texto, re.IGNORECASE)
-    m_month_year = re.search(r"de\s+(\w+)\s+de\s+(\d{4})", texto, re.IGNORECASE)
-    if m_weekday and m_month_year:
-        day_str = m_weekday.group(1)
-        month_name = m_month_year.group(1)
-        year_str = m_month_year.group(2)
+    # Patrón 2: formato español limpio "16 DE ENERO DE 2026" (requiere palabra boundary antes del día)
+    m_es = re.search(r"(?:^|[^\d(])(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+de\s+(\d{4})", texto, re.IGNORECASE)
+    if m_es:
+        day_str, month_name, year_str = m_es.groups()
         month_num = _SPANISH_MONTHS.get(month_name.lower())
         if month_num:
             try:
