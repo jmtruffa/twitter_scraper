@@ -507,28 +507,44 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
     fecha = _extract_fecha(texto)
 
     reservas = None
-    # Patrón 1: número ANTES de "reservas" (layout típico de Tesseract)
+    # Patrón 1: número ANTES de "reservas"
     print(f"[DEBUG] Texto completo: {repr(low)}", flush=True)
-    print(f"[DEBUG] Buscando en texto ({len(low)} chars)...", flush=True)
     m_res_before = re.search(r"([\d\.,]+)\s+reservas", low, flags=re.IGNORECASE)
-    print(f"[DEBUG] Match reservas: {m_res_before}", flush=True)
+    print(f"[DEBUG] Match número ANTES de reservas: {m_res_before}", flush=True)
     if m_res_before:
-        print(f"[DEBUG] Grupo capturado: {m_res_before.group(1)}", flush=True)
         try:
             reservas = _normalize_number_es(m_res_before.group(1))
-            print(f"[DEBUG] Reservas parseado: {reservas}", flush=True)
+            print(f"[DEBUG] Reservas (patrón 1): {reservas}", flush=True)
         except Exception as e:
             print(f"[DEBUG] Error normalizando: {e}", flush=True)
             reservas = None
 
-    # Patrón 2: "reservas" seguido de número
+    # Patrón 2: "reservas" seguido de número (con texto basura en el medio)
     if reservas is None:
-        m_res_after = re.search(r"reserva\w*.*?([-+]?\s*[\d\.,]+)", texto, flags=re.IGNORECASE)
+        m_res_after = re.search(r"reservas\s+(?:en\s+)?(?:millones\s+)?(?:de\s+)?(?:usd)?\W{0,20}([\d\.,]+)", low, flags=re.IGNORECASE)
+        print(f"[DEBUG] Match reservas SEGUIDO de número: {m_res_after}", flush=True)
         if m_res_after:
             try:
                 reservas = _normalize_number_es(m_res_after.group(1))
-            except Exception:
+                print(f"[DEBUG] Reservas (patrón 2): {reservas}", flush=True)
+            except Exception as e:
+                print(f"[DEBUG] Error normalizando: {e}", flush=True)
                 reservas = None
+
+    # Patrón 3: buscar número grande (>1000) cerca de "reservas" en cualquier orden
+    if reservas is None:
+        # Buscar todos los números que parezcan reservas (>10000)
+        all_numbers = re.findall(r"[\d\.,]+", low)
+        print(f"[DEBUG] Todos los números encontrados: {all_numbers}", flush=True)
+        for num_str in all_numbers:
+            try:
+                val = _normalize_number_es(num_str)
+                if val > 10000:  # Las reservas son > 10000 millones USD
+                    reservas = val
+                    print(f"[DEBUG] Reservas (patrón 3 - número grande): {reservas}", flush=True)
+                    break
+            except Exception:
+                continue
 
     compra_venta = 0.0
     if "sin intervención" in low or "sin intervencion" in low:
