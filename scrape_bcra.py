@@ -685,11 +685,12 @@ def save_reservas_to_db(engine: Engine, parsed: dict) -> int:
     except Exception:
         raise ValueError(f"Valor de reservas_millones_usd inválido: {valor}")
 
-    print(f"[DB] Insert reservas_scrape fecha={fecha} valor={valor}", flush=True)
+    print(f"[DB] Upsert reservas_scrape fecha={fecha} valor={valor}", flush=True)
 
     insert_sql = text("""
         INSERT INTO public.reservas_scrape (date, valor)
         VALUES (:fecha, :valor)
+        ON CONFLICT (date) DO UPDATE SET valor = EXCLUDED.valor
     """)
 
     with engine.begin() as conn:
