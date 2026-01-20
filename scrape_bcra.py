@@ -624,10 +624,8 @@ def parse_bcra_image(img_path: Path) -> dict:
 
     print("[OCR] Ejecutando Tesseract...", flush=True)
     image = Image.open(img_path).convert("RGB")
-    # PSM 6 = assume single uniform block of text
-    # PSM 3 = fully automatic (default)
-    # PSM 11 = sparse text
-    texto = pytesseract.image_to_string(image, lang='spa+eng', config='--psm 6')
+    # Probar PSM 11 (sparse text) - mejor para infografías
+    texto = pytesseract.image_to_string(image, lang='spa+eng', config='--psm 11')
 
     if not texto.strip():
         raise RuntimeError("Tesseract no devolvió texto.")
