@@ -733,42 +733,49 @@ def save_compra_venta_to_db(engine: Engine, parsed: dict) -> int:
 # =========================================================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--target-date",
-        help="Fecha objetivo en formato YYYY-MM-DD (default: hoy en Buenos Aires).",
-        default=None,
-    )
-    args = parser.parse_args()
-    target_date = _parse_target_date(args.target_date)
-
-    print("=== Descargando imagen del BCRA desde X ===", flush=True)
-    img_path = download_bcra_image(target_date)
-
-    print("=== Parseando imagen con Tesseract ===", flush=True)
-    parsed = parse_bcra_image(img_path)
-    print("JSON parseado:", flush=True)
-    print(json.dumps(parsed, indent=2, ensure_ascii=False), flush=True)
-
-    print("=== Guardando en Postgres ===", flush=True)
-    try:
-        engine = build_engine()
-    except Exception:
-        return
+    start_time = datetime.now(BA_TZ)
+    print(f"=== Inicio: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ===", flush=True)
 
     try:
-        n1 = save_compra_venta_to_db(engine, parsed)
-        print(f"✅ Inserted {n1} rows into comprasMULCBCRA", flush=True)
-    except Exception:
-        return
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "--target-date",
+            help="Fecha objetivo en formato YYYY-MM-DD (default: hoy en Buenos Aires).",
+            default=None,
+        )
+        args = parser.parse_args()
+        target_date = _parse_target_date(args.target_date)
 
-    try:
-        n2 = save_reservas_to_db(engine, parsed)
-        print(f"✅ Inserted {n2} rows into reservas_scrape", flush=True)
-    except Exception:
-        return
+        print("=== Descargando imagen del BCRA desde X ===", flush=True)
+        img_path = download_bcra_image(target_date)
 
-    print("=== Proceso finalizado ===", flush=True)
+        print("=== Parseando imagen con Tesseract ===", flush=True)
+        parsed = parse_bcra_image(img_path)
+        print("JSON parseado:", flush=True)
+        print(json.dumps(parsed, indent=2, ensure_ascii=False), flush=True)
+
+        print("=== Guardando en Postgres ===", flush=True)
+        try:
+            engine = build_engine()
+        except Exception:
+            return
+
+        try:
+            n1 = save_compra_venta_to_db(engine, parsed)
+            print(f"✅ Inserted {n1} rows into comprasMULCBCRA", flush=True)
+        except Exception:
+            return
+
+        try:
+            n2 = save_reservas_to_db(engine, parsed)
+            print(f"✅ Inserted {n2} rows into reservas_scrape", flush=True)
+        except Exception:
+            return
+
+    finally:
+        end_time = datetime.now(BA_TZ)
+        duration = end_time - start_time
+        print(f"=== Fin: {end_time.strftime('%Y-%m-%d %H:%M:%S')} (duración: {duration}) ===", flush=True)
 
 
 if __name__ == "__main__":
