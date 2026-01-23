@@ -115,6 +115,121 @@ def _resolve_cookies_file() -> Path:
     return Path("cookies.json")
 
 
+def _get_login_credentials() -> tuple[str, str] | None:
+    """Returns (username, password) from env vars, or None if not set."""
+    username = os.environ.get("X_USERNAME")
+    password = os.environ.get("X_PASSWORD")
+    if username and password:
+        return (username, password)
+    return None
+
+
+def _perform_twitter_login(context, cookies_path: Path) -> bool:
+    """
+    Logs into Twitter/X using credentials from environment variables.
+    Saves cookies to cookies_path after successful login.
+    Returns True if login succeeded.
+    """
+    creds = _get_login_credentials()
+    if not creds:
+        print("[LOGIN] No hay credenciales en X_USERNAME/X_PASSWORD", flush=True)
+        return False
+
+    username, password = creds
+    print(f"[LOGIN] Iniciando sesión en X como {username}...", flush=True)
+
+    page = context.new_page()
+    try:
+        page.set_default_timeout(60000)
+
+        # Go to login page
+        page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)
+
+        # Enter username
+        username_input = page.locator('input[autocomplete="username"]')
+        username_input.wait_for(state="visible", timeout=30000)
+        username_input.fill(username)
+        page.wait_for_timeout(500)
+
+        # Click Next
+        next_button = page.locator('button:has-text("Next"), button:has-text("Siguiente")')
+        next_button.click()
+        page.wait_for_timeout(2000)
+
+        # Check if Twitter asks for email/phone verification (unusual activity)
+        unusual_check = page.locator('input[data-testid="ocfEnterTextTextInput"]')
+        if unusual_check.count() > 0 and unusual_check.is_visible():
+            print("[LOGIN] X pide verificación adicional (email/usuario), ingresando...", flush=True)
+            unusual_check.fill(username)
+            page.wait_for_timeout(500)
+            verify_next = page.locator('button[data-testid="ocfEnterTextNextButton"]')
+            if verify_next.count() > 0:
+                verify_next.click()
+                page.wait_for_timeout(2000)
+
+        # Enter password
+        password_input = page.locator('input[name="password"], input[type="password"]')
+        password_input.wait_for(state="visible", timeout=30000)
+        password_input.fill(password)
+        page.wait_for_timeout(500)
+
+        # Click Log in
+        login_button = page.locator('button[data-testid="LoginForm_Login_Button"]')
+        login_button.click()
+        page.wait_for_timeout(5000)
+
+        # Check if login succeeded (should be on home or not on login page)
+        current_url = page.url
+        if "/login" in current_url or "/flow/login" in current_url:
+            # Check for error messages
+            error = page.locator('[data-testid="error"], [role="alert"]')
+            if error.count() > 0:
+                error_text = error.first.inner_text()
+                print(f"[LOGIN] Error de login: {error_text}", flush=True)
+            else:
+                print("[LOGIN] Login falló - todavía en página de login", flush=True)
+            return False
+
+        print("[LOGIN] Login exitoso, guardando cookies...", flush=True)
+
+        # Extract and save cookies
+        cookies = context.cookies()
+        cookies_dict = {}
+        for cookie in cookies:
+            cookies_dict[cookie["name"]] = cookie["value"]
+
+        # Add a default User-Agent
+        cookies_dict["user-agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+
+        # Save cookies
+        cookies_path.write_text(json.dumps(cookies_dict, indent=2))
+        print(f"[LOGIN] Cookies guardadas en {cookies_path}", flush=True)
+
+        return True
+
+    except Exception as e:
+        print(f"[LOGIN] Error durante login: {e}", flush=True)
+        return False
+    finally:
+        page.close()
+
+
+def _needs_login(page) -> bool:
+    """Check if the current page indicates we need to log in."""
+    url = page.url
+    if "/i/flow/login" in url or "/login" in url:
+        return True
+    # Check for empty/blocked page (no content loaded)
+    try:
+        title = page.title()
+        if not title or title.strip() == "":
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _normalize_tweet_date(iso_ts: str) -> str:
     try:
         return datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).date().isoformat()
@@ -348,6 +463,25 @@ def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
         page.close()
 
 
+def _try_scrape_methods(context, target_date) -> str:
+    """Try all scraping methods. Returns image URL or raises exception."""
+    errors = []
+    # Try profile/media first, then search, then profile
+    try:
+        return _fetch_image_url_with_playwright_profile_media(context, target_date)
+    except Exception as e:
+        errors.append(f"profile/media: {e}")
+    try:
+        return _fetch_image_url_with_playwright_search(context, target_date)
+    except Exception as e:
+        errors.append(f"search: {e}")
+    try:
+        return _fetch_image_url_with_playwright_profile(context, target_date)
+    except Exception as e:
+        errors.append(f"profile: {e}")
+    raise RuntimeError(f"Todos los métodos fallaron: {'; '.join(errors)}")
+
+
 def _fetch_image_url_with_playwright(cookies_path: Path, target_date) -> str:
     try:
         from playwright.sync_api import sync_playwright
@@ -356,20 +490,33 @@ def _fetch_image_url_with_playwright(cookies_path: Path, target_date) -> str:
             "Falta instalar Playwright. Ejecutá: pip install playwright && playwright install"
         ) from exc
 
-    cookies = _read_cookies_file(cookies_path)
-    headers = _cookies_to_headers(cookies)
-    pw_cookies = _cookies_to_playwright_list(cookies)
+    # Try to load existing cookies, but don't fail if they don't exist
+    cookies = {}
+    pw_cookies = []
+    user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+
+    if cookies_path.exists():
+        try:
+            cookies = _read_cookies_file(cookies_path)
+            headers = _cookies_to_headers(cookies)
+            pw_cookies = _cookies_to_playwright_list(cookies)
+            user_agent = headers.get("User-Agent", user_agent)
+        except Exception as e:
+            print(f"[SCRAPER] Cookies inválidas, se intentará login: {e}", flush=True)
+            cookies = {}
+            pw_cookies = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            user_agent=headers.get("User-Agent"),
+            user_agent=user_agent,
             locale="es-ES",
             timezone_id="America/Argentina/Buenos_Aires",
         )
         try:
             if pw_cookies:
                 context.add_cookies(pw_cookies)
+
             page_headers = {
                 "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "accept-language": "es-ES,es;q=0.9,en;q=0.8",
@@ -377,16 +524,32 @@ def _fetch_image_url_with_playwright(cookies_path: Path, target_date) -> str:
             }
             context.set_extra_http_headers(page_headers)
 
-            # Try profile/media first, then search, then profile
+            # First attempt with existing cookies (or no cookies)
             try:
-                return _fetch_image_url_with_playwright_profile_media(context, target_date)
-            except Exception:
-                pass
-            try:
-                return _fetch_image_url_with_playwright_search(context, target_date)
-            except Exception:
-                pass
-            return _fetch_image_url_with_playwright_profile(context, target_date)
+                return _try_scrape_methods(context, target_date)
+            except RuntimeError as e:
+                error_msg = str(e).lower()
+                needs_auth = (
+                    "login" in error_msg or
+                    "cookies" in error_msg or
+                    "title=" in error_msg or  # Empty title usually means blocked/no auth
+                    not pw_cookies  # No cookies loaded
+                )
+                if not needs_auth:
+                    raise
+
+                print(f"[SCRAPER] Sesión inválida o expirada, intentando auto-login...", flush=True)
+
+                # Try auto-login
+                if _perform_twitter_login(context, cookies_path):
+                    print("[SCRAPER] Login exitoso, reintentando scraping...", flush=True)
+                    # Retry after login
+                    return _try_scrape_methods(context, target_date)
+                else:
+                    raise RuntimeError(
+                        "No se pudo hacer login automático. "
+                        "Verificá X_USERNAME y X_PASSWORD o renovar cookies manualmente."
+                    )
         finally:
             context.close()
             browser.close()
