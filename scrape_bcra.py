@@ -142,41 +142,128 @@ def _perform_twitter_login(context, cookies_path: Path) -> bool:
     try:
         page.set_default_timeout(60000)
 
-        # Go to login page
-        page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded", timeout=60000)
+        # Go to login page - try main site first then login flow
+        page.goto("https://x.com/login", wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except Exception:
+            pass
         page.wait_for_timeout(3000)
 
-        # Enter username
-        username_input = page.locator('input[autocomplete="username"]')
-        username_input.wait_for(state="visible", timeout=30000)
-        username_input.fill(username)
-        page.wait_for_timeout(500)
+        # Try multiple selectors for username input
+        username_selectors = [
+            'input[autocomplete="username"]',
+            'input[name="text"]',
+            'input[name="session[username_or_email]"]',
+            'input[type="text"]',
+        ]
+        username_input = None
+        for selector in username_selectors:
+            try:
+                loc = page.locator(selector).first
+                if loc.count() > 0 and loc.is_visible():
+                    username_input = loc
+                    print(f"[LOGIN] Encontrado input de usuario con: {selector}", flush=True)
+                    break
+            except Exception:
+                continue
 
-        # Click Next
-        next_button = page.locator('button:has-text("Next"), button:has-text("Siguiente")')
-        next_button.click()
-        page.wait_for_timeout(2000)
+        if not username_input:
+            # Wait a bit more and retry
+            page.wait_for_timeout(5000)
+            for selector in username_selectors:
+                try:
+                    loc = page.locator(selector).first
+                    if loc.count() > 0:
+                        loc.wait_for(state="visible", timeout=15000)
+                        username_input = loc
+                        print(f"[LOGIN] Encontrado input de usuario (retry) con: {selector}", flush=True)
+                        break
+                except Exception:
+                    continue
+
+        if not username_input:
+            print(f"[LOGIN] No se encontró el campo de usuario. URL actual: {page.url}", flush=True)
+            return False
+
+        username_input.fill(username)
+        page.wait_for_timeout(1000)
+
+        # Click Next button
+        next_selectors = [
+            'button:has-text("Next")',
+            'button:has-text("Siguiente")',
+            'div[role="button"]:has-text("Next")',
+            'div[role="button"]:has-text("Siguiente")',
+        ]
+        for selector in next_selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.count() > 0 and btn.is_visible():
+                    btn.click()
+                    print(f"[LOGIN] Click en Next con: {selector}", flush=True)
+                    break
+            except Exception:
+                continue
+
+        page.wait_for_timeout(3000)
 
         # Check if Twitter asks for email/phone verification (unusual activity)
         unusual_check = page.locator('input[data-testid="ocfEnterTextTextInput"]')
-        if unusual_check.count() > 0 and unusual_check.is_visible():
-            print("[LOGIN] X pide verificación adicional (email/usuario), ingresando...", flush=True)
-            unusual_check.fill(username)
-            page.wait_for_timeout(500)
-            verify_next = page.locator('button[data-testid="ocfEnterTextNextButton"]')
-            if verify_next.count() > 0:
-                verify_next.click()
-                page.wait_for_timeout(2000)
+        try:
+            if unusual_check.count() > 0 and unusual_check.is_visible():
+                print("[LOGIN] X pide verificación adicional (email/usuario), ingresando...", flush=True)
+                unusual_check.fill(username)
+                page.wait_for_timeout(500)
+                verify_next = page.locator('button[data-testid="ocfEnterTextNextButton"]')
+                if verify_next.count() > 0:
+                    verify_next.click()
+                    page.wait_for_timeout(3000)
+        except Exception:
+            pass
 
-        # Enter password
-        password_input = page.locator('input[name="password"], input[type="password"]')
-        password_input.wait_for(state="visible", timeout=30000)
+        # Enter password - try multiple selectors
+        password_selectors = [
+            'input[name="password"]',
+            'input[type="password"]',
+            'input[autocomplete="current-password"]',
+        ]
+        password_input = None
+        for selector in password_selectors:
+            try:
+                loc = page.locator(selector).first
+                if loc.count() > 0:
+                    loc.wait_for(state="visible", timeout=15000)
+                    password_input = loc
+                    print(f"[LOGIN] Encontrado input de password con: {selector}", flush=True)
+                    break
+            except Exception:
+                continue
+
+        if not password_input:
+            print(f"[LOGIN] No se encontró el campo de password. URL actual: {page.url}", flush=True)
+            return False
+
         password_input.fill(password)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(1000)
 
-        # Click Log in
-        login_button = page.locator('button[data-testid="LoginForm_Login_Button"]')
-        login_button.click()
+        # Click Log in button
+        login_selectors = [
+            'button[data-testid="LoginForm_Login_Button"]',
+            'button:has-text("Log in")',
+            'button:has-text("Iniciar sesión")',
+            'div[role="button"]:has-text("Log in")',
+        ]
+        for selector in login_selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.count() > 0 and btn.is_visible():
+                    btn.click()
+                    print(f"[LOGIN] Click en Login con: {selector}", flush=True)
+                    break
+            except Exception:
+                continue
+
         page.wait_for_timeout(5000)
 
         # Check if login succeeded (should be on home or not on login page)
@@ -185,10 +272,13 @@ def _perform_twitter_login(context, cookies_path: Path) -> bool:
             # Check for error messages
             error = page.locator('[data-testid="error"], [role="alert"]')
             if error.count() > 0:
-                error_text = error.first.inner_text()
-                print(f"[LOGIN] Error de login: {error_text}", flush=True)
+                try:
+                    error_text = error.first.inner_text()
+                    print(f"[LOGIN] Error de login: {error_text}", flush=True)
+                except Exception:
+                    print("[LOGIN] Error de login (no se pudo leer mensaje)", flush=True)
             else:
-                print("[LOGIN] Login falló - todavía en página de login", flush=True)
+                print(f"[LOGIN] Login falló - todavía en página de login: {current_url}", flush=True)
             return False
 
         print("[LOGIN] Login exitoso, guardando cookies...", flush=True)
@@ -210,6 +300,7 @@ def _perform_twitter_login(context, cookies_path: Path) -> bool:
 
     except Exception as e:
         print(f"[LOGIN] Error durante login: {e}", flush=True)
+        print(f"[LOGIN] URL actual: {page.url}", flush=True)
         return False
     finally:
         page.close()
@@ -419,6 +510,7 @@ def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
             raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
         target_iso = target_date.isoformat()
         candidates = page.locator("article, div[data-testid='cellInnerDiv']")
+        found_dates = []  # Debug: track what dates we find
         for _ in range(8):
             if candidates.count() == 0:
                 page.wait_for_timeout(1500)
@@ -431,7 +523,10 @@ def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
                     if time_el.count() == 0:
                         continue
                     iso_ts = time_el.first.get_attribute("datetime") or ""
-                    if _normalize_tweet_date(iso_ts) != target_iso:
+                    tweet_date = _normalize_tweet_date(iso_ts)
+                    if tweet_date and tweet_date not in found_dates:
+                        found_dates.append(tweet_date)
+                    if tweet_date != target_iso:
                         continue
                     img = node.locator("img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
                     if img.count() == 0:
@@ -446,6 +541,10 @@ def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
                     continue
             page.mouse.wheel(0, 1400)
             page.wait_for_timeout(1500)
+        # Debug output
+        if found_dates:
+            print(f"[DEBUG] Fechas encontradas en profile/media: {found_dates[:10]}", flush=True)
+            print(f"[DEBUG] Buscando fecha: {target_iso}", flush=True)
         status_urls = _collect_status_urls(page)
         try:
             return _fetch_image_from_status_urls(context, status_urls, target_date)
