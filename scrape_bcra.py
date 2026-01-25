@@ -542,9 +542,11 @@ def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
             page.mouse.wheel(0, 1400)
             page.wait_for_timeout(1500)
         # Debug output
+        print(f"[DEBUG] Buscando fecha: {target_iso}", flush=True)
         if found_dates:
             print(f"[DEBUG] Fechas encontradas en profile/media: {found_dates[:10]}", flush=True)
-            print(f"[DEBUG] Buscando fecha: {target_iso}", flush=True)
+        else:
+            print(f"[DEBUG] No se encontraron fechas en profile/media. Candidatos encontrados: {candidates.count()}", flush=True)
         status_urls = _collect_status_urls(page)
         try:
             return _fetch_image_from_status_urls(context, status_urls, target_date)
@@ -628,13 +630,15 @@ def _fetch_image_url_with_playwright(cookies_path: Path, target_date) -> str:
                 return _try_scrape_methods(context, target_date)
             except RuntimeError as e:
                 error_msg = str(e).lower()
+                # Only try login if we actually got redirected to login or got blocked
+                # Don't try login just because we didn't find a tweet for today's date
                 needs_auth = (
-                    "login" in error_msg or
-                    "cookies" in error_msg or
-                    "title=" in error_msg or  # Empty title usually means blocked/no auth
-                    not pw_cookies  # No cookies loaded
+                    "redirigió al login" in error_msg or
+                    "cookies inválidas" in error_msg or
+                    ("title=" in error_msg and "title= " in error_msg)  # Empty title = blocked
                 )
                 if not needs_auth:
+                    # Pages loaded fine, just no tweet found - don't try login
                     raise
 
                 print(f"[SCRAPER] Sesión inválida o expirada, intentando auto-login...", flush=True)
