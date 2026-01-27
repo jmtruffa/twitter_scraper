@@ -150,40 +150,32 @@ def _perform_twitter_login(context, cookies_path: Path) -> bool:
             pass
         page.wait_for_timeout(3000)
 
-        # Try multiple selectors for username input
+        # Try multiple selectors for username input - name="text" is the current one
         username_selectors = [
-            'input[autocomplete="username"]',
             'input[name="text"]',
+            'input[autocomplete="username"]',
             'input[name="session[username_or_email]"]',
-            'input[type="text"]',
         ]
         username_input = None
         for selector in username_selectors:
             try:
-                loc = page.locator(selector).first
-                if loc.count() > 0 and loc.is_visible():
-                    username_input = loc
+                loc = page.locator(selector)
+                if loc.count() > 0:
+                    loc.first.wait_for(state="visible", timeout=10000)
+                    username_input = loc.first
                     print(f"[LOGIN] Encontrado input de usuario con: {selector}", flush=True)
                     break
             except Exception:
                 continue
 
         if not username_input:
-            # Wait a bit more and retry
-            page.wait_for_timeout(5000)
-            for selector in username_selectors:
-                try:
-                    loc = page.locator(selector).first
-                    if loc.count() > 0:
-                        loc.wait_for(state="visible", timeout=15000)
-                        username_input = loc
-                        print(f"[LOGIN] Encontrado input de usuario (retry) con: {selector}", flush=True)
-                        break
-                except Exception:
-                    continue
-
-        if not username_input:
             print(f"[LOGIN] No se encontró el campo de usuario. URL actual: {page.url}", flush=True)
+            # Debug: show what inputs exist
+            try:
+                all_inputs = page.locator('input')
+                print(f"[LOGIN] Inputs en la página: {all_inputs.count()}", flush=True)
+            except Exception:
+                pass
             return False
 
         username_input.fill(username)
@@ -608,12 +600,22 @@ def _fetch_image_url_with_playwright(cookies_path: Path, target_date) -> str:
             pw_cookies = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Anti-detection: disable automation flags
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+            ]
+        )
         context = browser.new_context(
             user_agent=user_agent,
             locale="es-ES",
             timezone_id="America/Argentina/Buenos_Aires",
+            viewport={'width': 1280, 'height': 720},
         )
+        # Anti-detection: hide webdriver property
+        context.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined});')
         try:
             if pw_cookies:
                 context.add_cookies(pw_cookies)
@@ -625,40 +627,266 @@ def _fetch_image_url_with_playwright(cookies_path: Path, target_date) -> str:
             }
             context.set_extra_http_headers(page_headers)
 
-            # First attempt with existing cookies (or no cookies)
+            # If no cookies, login first (X.com shows old/random tweets without auth)
+            if not pw_cookies:
+                print("[SCRAPER] No hay cookies, intentando login primero...", flush=True)
+                if _perform_twitter_login(context, cookies_path):
+                    print("[SCRAPER] Login exitoso, procediendo con scraping...", flush=True)
+                else:
+                    print("[SCRAPER] Login falló, intentando scraping sin auth...", flush=True)
+
+            # Try scraping
             try:
                 return _try_scrape_methods(context, target_date)
             except RuntimeError as e:
                 error_msg = str(e).lower()
-                # Only try login if we actually got redirected to login or got blocked
-                # Don't try login just because we didn't find a tweet for today's date
-                needs_auth = (
+                # If we already have cookies but got redirected to login, try re-login
+                needs_reauth = (
                     "redirigió al login" in error_msg or
-                    "cookies inválidas" in error_msg or
-                    ("title=" in error_msg and "title= " in error_msg)  # Empty title = blocked
+                    "cookies inválidas" in error_msg
                 )
-                if not needs_auth:
-                    # Pages loaded fine, just no tweet found - don't try login
-                    raise
-
-                print(f"[SCRAPER] Sesión inválida o expirada, intentando auto-login...", flush=True)
-
-                # Try auto-login
-                if _perform_twitter_login(context, cookies_path):
-                    print("[SCRAPER] Login exitoso, reintentando scraping...", flush=True)
-                    # Retry after login
-                    return _try_scrape_methods(context, target_date)
-                else:
-                    raise RuntimeError(
-                        "No se pudo hacer login automático. "
-                        "Verificá X_USERNAME y X_PASSWORD o renovar cookies manualmente."
-                    )
+                if needs_reauth and pw_cookies:
+                    print(f"[SCRAPER] Sesión expirada, intentando re-login...", flush=True)
+                    if _perform_twitter_login(context, cookies_path):
+                        print("[SCRAPER] Re-login exitoso, reintentando scraping...", flush=True)
+                        return _try_scrape_methods(context, target_date)
+                raise
         finally:
             context.close()
             browser.close()
 
 
-def download_bcra_image(target_date) -> Path:
+# =========================================================
+# === SELENIUM IMPLEMENTATION =============================
+# =========================================================
+
+def _fetch_image_url_with_selenium(cookies_path: Path, target_date) -> str:
+    """Selenium-based scraping as alternative to Playwright."""
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.common.exceptions import TimeoutException
+    except ImportError as exc:
+        raise RuntimeError(
+            "Falta instalar Selenium. Ejecutá: pip install selenium webdriver-manager"
+        ) from exc
+
+    # Setup Chrome options
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--window-size=1280,720")
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+
+    # Try to use webdriver-manager for automatic chromedriver
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+    except Exception:
+        # Fallback to system chromedriver
+        driver = webdriver.Chrome(options=chrome_options)
+
+    # Hide webdriver property
+    driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+        'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'
+    })
+
+    try:
+        # Load existing cookies if available
+        pw_cookies = []
+        if cookies_path.exists():
+            try:
+                cookies = _read_cookies_file(cookies_path)
+                pw_cookies = _cookies_to_playwright_list(cookies)
+            except Exception as e:
+                print(f"[SELENIUM] Cookies inválidas: {e}", flush=True)
+
+        # First navigate to x.com to set domain for cookies
+        driver.get("https://x.com")
+        import time
+        time.sleep(2)
+
+        # Add cookies if we have them
+        if pw_cookies:
+            for cookie in pw_cookies:
+                try:
+                    selenium_cookie = {
+                        "name": cookie["name"],
+                        "value": cookie["value"],
+                        "domain": ".x.com",
+                        "path": "/",
+                        "secure": True,
+                    }
+                    driver.add_cookie(selenium_cookie)
+                except Exception:
+                    pass
+            driver.refresh()
+            time.sleep(2)
+
+        # If no cookies, try login
+        if not pw_cookies:
+            print("[SELENIUM] No hay cookies, intentando login...", flush=True)
+            if _perform_selenium_login(driver, cookies_path):
+                print("[SELENIUM] Login exitoso", flush=True)
+            else:
+                print("[SELENIUM] Login falló, continuando sin auth...", flush=True)
+
+        # Navigate to profile/media
+        target_iso = target_date.isoformat()
+        media_url = f"https://x.com/{USERNAME}/media"
+        print(f"[SELENIUM] Navegando a {media_url}", flush=True)
+        driver.get(media_url)
+        time.sleep(5)
+
+        # Check if redirected to login
+        if "/login" in driver.current_url:
+            print("[SELENIUM] Redirigido a login, intentando autenticación...", flush=True)
+            if _perform_selenium_login(driver, cookies_path):
+                driver.get(media_url)
+                time.sleep(5)
+            else:
+                raise RuntimeError("Selenium: redirigido al login y no se pudo autenticar")
+
+        # Scroll and search for tweets
+        found_dates = []
+        for scroll_attempt in range(8):
+            # Find time elements
+            try:
+                time_elements = driver.find_elements(By.TAG_NAME, "time")
+                for time_el in time_elements:
+                    try:
+                        iso_ts = time_el.get_attribute("datetime") or ""
+                        tweet_date = _normalize_tweet_date(iso_ts)
+                        if tweet_date and tweet_date not in found_dates:
+                            found_dates.append(tweet_date)
+                        if tweet_date == target_iso:
+                            # Found matching date, look for image in parent article
+                            article = time_el.find_element(By.XPATH, "./ancestor::article")
+                            images = article.find_elements(By.CSS_SELECTOR, "img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
+                            if images:
+                                src = images[0].get_attribute("src")
+                                if src:
+                                    if "name=" in src:
+                                        src = re.sub(r"name=[a-z]+", "name=large", src)
+                                    print(f"[SELENIUM] Imagen encontrada: {src[:80]}...", flush=True)
+                                    return src
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Scroll down
+            driver.execute_script("window.scrollBy(0, 1400);")
+            time.sleep(2)
+
+        # Debug output
+        print(f"[DEBUG] Buscando fecha: {target_iso}", flush=True)
+        if found_dates:
+            print(f"[DEBUG] Fechas encontradas: {found_dates[:10]}", flush=True)
+        else:
+            print(f"[DEBUG] No se encontraron fechas en la página", flush=True)
+
+        raise RuntimeError(f"Selenium: No se encontró imagen para {target_iso}")
+
+    finally:
+        driver.quit()
+
+
+def _perform_selenium_login(driver, cookies_path: Path) -> bool:
+    """Perform Twitter login using Selenium."""
+    import time
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    creds = _get_login_credentials()
+    if not creds:
+        print("[SELENIUM LOGIN] No hay credenciales en X_USERNAME/X_PASSWORD", flush=True)
+        return False
+
+    username, password = creds
+    print(f"[SELENIUM LOGIN] Iniciando sesión como {username}...", flush=True)
+
+    try:
+        driver.get("https://x.com/i/flow/login")
+        time.sleep(5)
+
+        # Find and fill username
+        wait = WebDriverWait(driver, 20)
+        username_input = wait.until(EC.presence_of_element_located((By.NAME, "text")))
+        username_input.clear()
+        for char in username:
+            username_input.send_keys(char)
+            time.sleep(0.1)
+        time.sleep(1)
+
+        # Click Next
+        next_buttons = driver.find_elements(By.XPATH, "//button[contains(., 'Next') or contains(., 'Siguiente')]")
+        if next_buttons:
+            next_buttons[0].click()
+        else:
+            username_input.send_keys(Keys.RETURN)
+        time.sleep(3)
+
+        # Check for unusual activity verification
+        try:
+            unusual_input = driver.find_element(By.CSS_SELECTOR, 'input[data-testid="ocfEnterTextTextInput"]')
+            if unusual_input.is_displayed():
+                print("[SELENIUM LOGIN] Verificación adicional detectada...", flush=True)
+                unusual_input.send_keys(username)
+                verify_btn = driver.find_element(By.CSS_SELECTOR, 'button[data-testid="ocfEnterTextNextButton"]')
+                verify_btn.click()
+                time.sleep(3)
+        except Exception:
+            pass
+
+        # Find and fill password
+        password_input = wait.until(EC.presence_of_element_located((By.NAME, "password")))
+        password_input.clear()
+        for char in password:
+            password_input.send_keys(char)
+            time.sleep(0.05)
+        time.sleep(1)
+
+        # Click Login
+        login_btn = driver.find_element(By.CSS_SELECTOR, 'button[data-testid="LoginForm_Login_Button"]')
+        login_btn.click()
+        time.sleep(5)
+
+        # Check if login succeeded
+        if "/login" in driver.current_url or "/flow/login" in driver.current_url:
+            print(f"[SELENIUM LOGIN] Falló - todavía en: {driver.current_url}", flush=True)
+            return False
+
+        print("[SELENIUM LOGIN] Login exitoso, guardando cookies...", flush=True)
+
+        # Save cookies
+        selenium_cookies = driver.get_cookies()
+        cookies_dict = {}
+        for cookie in selenium_cookies:
+            cookies_dict[cookie["name"]] = cookie["value"]
+        cookies_dict["user-agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        cookies_path.write_text(json.dumps(cookies_dict, indent=2))
+        print(f"[SELENIUM LOGIN] Cookies guardadas en {cookies_path}", flush=True)
+
+        return True
+
+    except Exception as e:
+        print(f"[SELENIUM LOGIN] Error: {e}", flush=True)
+        return False
+
+
+def download_bcra_image(target_date, use_selenium: bool = False) -> Path:
     """Descarga la imagen del tweet #DataBCRA para la fecha indicada."""
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
     fname = f"bcra_{target_date.isoformat()}.jpg"
@@ -669,9 +897,14 @@ def download_bcra_image(target_date) -> Path:
         print(f"♻️ Imagen ya descargada, reusando: {out_path}", flush=True)
         return out_path
 
-    print("[SCRAPER] Descargando imagen vía Playwright...", flush=True)
     cookies_path = _resolve_cookies_file()
-    img_url = _fetch_image_url_with_playwright(cookies_path, target_date)
+
+    if use_selenium:
+        print("[SCRAPER] Descargando imagen vía Selenium...", flush=True)
+        img_url = _fetch_image_url_with_selenium(cookies_path, target_date)
+    else:
+        print("[SCRAPER] Descargando imagen vía Playwright...", flush=True)
+        img_url = _fetch_image_url_with_playwright(cookies_path, target_date)
 
     ir = requests.get(img_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
     ir.raise_for_status()
@@ -1009,34 +1242,41 @@ def main():
             help="Fecha objetivo en formato YYYY-MM-DD (default: hoy en Buenos Aires).",
             default=None,
         )
+        parser.add_argument(
+            "--use-selenium",
+            action="store_true",
+            help="Usar Selenium en lugar de Playwright para scraping.",
+        )
         args = parser.parse_args()
         target_date = _parse_target_date(args.target_date)
 
         print("=== Descargando imagen del BCRA desde X ===", flush=True)
-        img_path = download_bcra_image(target_date)
+        img_path = download_bcra_image(target_date, use_selenium=args.use_selenium)
 
         print("=== Parseando imagen con Tesseract ===", flush=True)
         parsed = parse_bcra_image(img_path)
         print("JSON parseado:", flush=True)
         print(json.dumps(parsed, indent=2, ensure_ascii=False), flush=True)
 
-        print("=== Guardando en Postgres ===", flush=True)
-        try:
-            engine = build_engine()
-        except Exception:
-            return
-
-        try:
-            n1 = save_compra_venta_to_db(engine, parsed)
-            print(f"✅ Inserted {n1} rows into comprasMULCBCRA", flush=True)
-        except Exception:
-            return
-
-        try:
-            n2 = save_reservas_to_db(engine, parsed)
-            print(f"✅ Inserted {n2} rows into reservas_scrape", flush=True)
-        except Exception:
-            return
+        # === DATABASE DISABLED FOR LOCAL TESTING ===
+        # print("=== Guardando en Postgres ===", flush=True)
+        # try:
+        #     engine = build_engine()
+        # except Exception:
+        #     return
+        #
+        # try:
+        #     n1 = save_compra_venta_to_db(engine, parsed)
+        #     print(f"✅ Inserted {n1} rows into comprasMULCBCRA", flush=True)
+        # except Exception:
+        #     return
+        #
+        # try:
+        #     n2 = save_reservas_to_db(engine, parsed)
+        #     print(f"✅ Inserted {n2} rows into reservas_scrape", flush=True)
+        # except Exception:
+        #     return
+        print("=== Database operations DISABLED for testing ===", flush=True)
 
     finally:
         end_time = datetime.now(BA_TZ)
