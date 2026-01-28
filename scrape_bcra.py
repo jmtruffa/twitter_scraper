@@ -323,8 +323,9 @@ def _normalize_tweet_date(iso_ts: str) -> str:
 def _build_search_query(target_date) -> str:
     since = target_date.isoformat()
     until = (target_date + timedelta(days=1)).isoformat()
+    # Usar OR para los hashtags (el tweet puede tener cualquiera de los dos)
     return (
-        f"from:{USERNAME} {REQUIRED_HASHTAGS[0]} {REQUIRED_HASHTAGS[1]} "
+        f"from:{USERNAME} ({REQUIRED_HASHTAGS[0]} OR {REQUIRED_HASHTAGS[1]}) "
         f"filter:images since:{since} until:{until}"
     )
 
@@ -389,41 +390,47 @@ def _fetch_image_from_status_urls(context, status_urls: list[str], target_date) 
 
 
 def _fetch_image_url_with_playwright_search(context, target_date) -> str:
+    """Busca imagen usando X search con filtro de fecha. Simple y directo."""
     query = _build_search_query(target_date)
-    search_urls = [
-        f"https://x.com/search?q={requests.utils.quote(query)}&f=live",
-        f"https://x.com/search?q={requests.utils.quote(query)}&src=typed_query",
-        f"https://x.com/search?q={requests.utils.quote(query)}&f=top",
-    ]
+    search_url = f"https://x.com/search?q={requests.utils.quote(query)}&f=live"
+
     page = context.new_page()
     try:
         page.set_default_timeout(60000)
-        for search_url in search_urls:
-            page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-            if "/i/flow/login" in page.url or "/login" in page.url:
-                raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
-            candidates = page.locator("article, div[data-testid='cellInnerDiv']")
-            for _ in range(6):
-                if candidates.count() == 0:
-                    page.wait_for_timeout(1500)
-                    page.mouse.wheel(0, 1200)
-                    continue
-                status_urls = _collect_status_urls(page)
-                if status_urls:
-                    try:
-                        return _fetch_image_from_status_urls(context, status_urls, target_date)
-                    except Exception:
-                        pass
-                page.mouse.wheel(0, 1200)
-                page.wait_for_timeout(1500)
-        title = ""
+        print(f"[SEARCH] Navegando a: {search_url}", flush=True)
+        page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+
+        # Esperar que cargue el contenido
+        page.wait_for_timeout(3000)
+
+        if "/i/flow/login" in page.url or "/login" in page.url:
+            raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
+
+        # La búsqueda ya filtra por fecha, cuenta y hashtags.
+        # Si hay imagen en los resultados, es la que buscamos.
+        for attempt in range(5):
+            # Buscar imágenes de Twitter media
+            img = page.locator("img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
+            if img.count() > 0:
+                src = img.first.get_attribute("src")
+                if src:
+                    if "name=" in src:
+                        src = re.sub(r"name=[a-z]+", "name=large", src)
+                    print(f"[SEARCH] Imagen encontrada: {src[:80]}...", flush=True)
+                    return src
+
+            # Scroll y esperar más contenido
+            page.mouse.wheel(0, 1000)
+            page.wait_for_timeout(2000)
+
+        # Debug: guardar screenshot si falla
         try:
-            title = page.title()
+            page.screenshot(path="/tmp/search_debug.png")
+            print("[SEARCH] Screenshot guardado en /tmp/search_debug.png", flush=True)
         except Exception:
-            title = ""
-        raise RuntimeError(
-            f"No encontré imagen en búsqueda. url={page.url} title={title}"
-        )
+            pass
+
+        raise RuntimeError(f"No encontré imagen en búsqueda para {target_date}")
     finally:
         page.close()
 
@@ -503,6 +510,8 @@ def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
         target_iso = target_date.isoformat()
         candidates = page.locator("article, div[data-testid='cellInnerDiv']")
         found_dates = []  # Debug: track what dates we find
+        debug_time_count = 0  # Debug: count how many candidates have time elements
+        debug_no_time_count = 0  # Debug: count candidates without time
         for _ in range(8):
             if candidates.count() == 0:
                 page.wait_for_timeout(1500)
@@ -513,7 +522,9 @@ def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
                     node = candidates.nth(idx)
                     time_el = node.locator("time")
                     if time_el.count() == 0:
+                        debug_no_time_count += 1
                         continue
+                    debug_time_count += 1
                     iso_ts = time_el.first.get_attribute("datetime") or ""
                     tweet_date = _normalize_tweet_date(iso_ts)
                     if tweet_date and tweet_date not in found_dates:
@@ -557,22 +568,71 @@ def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
 
 
 def _try_scrape_methods(context, target_date) -> str:
-    """Try all scraping methods. Returns image URL or raises exception."""
-    errors = []
-    # Try profile/media first, then search, then profile
+    """Busca imagen en el perfil del BCRA scrolleando el timeline."""
+    profile_url = f"https://x.com/{USERNAME}"
+    target_iso = target_date.isoformat()
+
+    page = context.new_page()
     try:
-        return _fetch_image_url_with_playwright_profile_media(context, target_date)
-    except Exception as e:
-        errors.append(f"profile/media: {e}")
-    try:
-        return _fetch_image_url_with_playwright_search(context, target_date)
-    except Exception as e:
-        errors.append(f"search: {e}")
-    try:
-        return _fetch_image_url_with_playwright_profile(context, target_date)
-    except Exception as e:
-        errors.append(f"profile: {e}")
-    raise RuntimeError(f"Todos los métodos fallaron: {'; '.join(errors)}")
+        page.set_default_timeout(60000)
+        print(f"[SCRAPER] Navegando a {profile_url}", flush=True)
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)
+
+        if "/i/flow/login" in page.url or "/login" in page.url:
+            raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
+
+        # Scrollear el timeline buscando tweet con imagen de la fecha objetivo
+        for scroll in range(15):  # Máximo 15 scrolls
+            # Usar JavaScript para encontrar tweets con fechas e imágenes
+            result = page.evaluate('''(targetDate) => {
+                const tweets = document.querySelectorAll('article');
+                for (const tweet of tweets) {
+                    // Buscar elemento time con datetime
+                    const timeEl = tweet.querySelector('time[datetime]');
+                    if (!timeEl) continue;
+
+                    const datetime = timeEl.getAttribute('datetime');
+                    if (!datetime) continue;
+
+                    // Extraer fecha (YYYY-MM-DD) del datetime
+                    const tweetDate = datetime.split('T')[0];
+                    if (tweetDate !== targetDate) continue;
+
+                    // Buscar imagen de media
+                    const img = tweet.querySelector('img[src*="twimg.com/media"], img[src*="pbs.twimg.com/media"]');
+                    if (!img) continue;
+
+                    const src = img.getAttribute('src');
+                    if (src) {
+                        return { found: true, src: src, date: tweetDate };
+                    }
+                }
+                return { found: false, count: tweets.length };
+            }''', target_iso)
+
+            if result.get('found'):
+                src = result['src']
+                if "name=" in src:
+                    src = re.sub(r"name=[a-z]+", "name=large", src)
+                print(f"[SCRAPER] Imagen encontrada para {result['date']}", flush=True)
+                return src
+
+            print(f"[SCRAPER] Scroll {scroll + 1}/15, tweets visibles: {result.get('count', 0)}", flush=True)
+            page.mouse.wheel(0, 1500)
+            page.wait_for_timeout(2000)
+
+        # Debug: guardar screenshot si no encuentra
+        try:
+            page.screenshot(path="/tmp/profile_debug.png")
+            print("[SCRAPER] Screenshot guardado en /tmp/profile_debug.png", flush=True)
+        except Exception:
+            pass
+
+        raise RuntimeError(f"No encontré imagen para {target_iso} después de scrollear el timeline")
+
+    finally:
+        page.close()
 
 
 def _fetch_image_url_with_playwright(cookies_path: Path, target_date) -> str:
@@ -878,9 +938,19 @@ def parse_bcra_image(img_path: Path) -> dict:
         ) from exc
 
     print("[OCR] Ejecutando Tesseract...", flush=True)
-    image = Image.open(img_path).convert("RGB")
-    # Probar PSM 11 (sparse text) - mejor para infografías
-    texto = pytesseract.image_to_string(image, lang='spa+eng', config='--psm 11')
+    image = Image.open(img_path)
+
+    # Preprocesar imagen: binarización con threshold 160
+    # Esto mejora el reconocimiento de dígitos preservando puntos decimales
+    image_gray = image.convert("L")
+    image_binary = image_gray.point(lambda x: 255 if x > 160 else 0, '1')
+
+    # PSM 6 (uniform block) funciona bien con texto estructurado
+    texto = pytesseract.image_to_string(image_binary, lang='spa+eng', config='--psm 6')
+
+    if not texto.strip():
+        # Fallback a PSM 11 si PSM 6 no devuelve nada
+        texto = pytesseract.image_to_string(image_binary, lang='spa+eng', config='--psm 11')
 
     if not texto.strip():
         raise RuntimeError("Tesseract no devolvió texto.")
@@ -1024,25 +1094,23 @@ def main():
         print("JSON parseado:", flush=True)
         print(json.dumps(parsed, indent=2, ensure_ascii=False), flush=True)
 
-        # === DATABASE DISABLED FOR LOCAL TESTING ===
-        # print("=== Guardando en Postgres ===", flush=True)
-        # try:
-        #     engine = build_engine()
-        # except Exception:
-        #     return
-        #
-        # try:
-        #     n1 = save_compra_venta_to_db(engine, parsed)
-        #     print(f"✅ Inserted {n1} rows into comprasMULCBCRA", flush=True)
-        # except Exception:
-        #     return
-        #
-        # try:
-        #     n2 = save_reservas_to_db(engine, parsed)
-        #     print(f"✅ Inserted {n2} rows into reservas_scrape", flush=True)
-        # except Exception:
-        #     return
-        print("=== Database operations DISABLED for testing ===", flush=True)
+        print("=== Guardando en Postgres ===", flush=True)
+        try:
+            engine = build_engine()
+        except Exception:
+            return
+
+        try:
+            n1 = save_compra_venta_to_db(engine, parsed)
+            print(f"✅ Inserted {n1} rows into comprasMULCBCRA", flush=True)
+        except Exception:
+            return
+
+        try:
+            n2 = save_reservas_to_db(engine, parsed)
+            print(f"✅ Inserted {n2} rows into reservas_scrape", flush=True)
+        except Exception:
+            return
 
     finally:
         end_time = datetime.now(BA_TZ)
