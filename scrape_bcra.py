@@ -940,10 +940,10 @@ def parse_bcra_image(img_path: Path) -> dict:
     print("[OCR] Ejecutando Tesseract...", flush=True)
     image = Image.open(img_path)
 
-    # Preprocesar imagen: binarización con threshold 160
+    # Preprocesar imagen: binarización con threshold 180
     # Esto mejora el reconocimiento de dígitos preservando puntos decimales
     image_gray = image.convert("L")
-    image_binary = image_gray.point(lambda x: 255 if x > 160 else 0, '1')
+    image_binary = image_gray.point(lambda x: 255 if x > 180 else 0, '1')
 
     # PSM 6 (uniform block) funciona bien con texto estructurado
     texto = pytesseract.image_to_string(image_binary, lang='spa+eng', config='--psm 6')
