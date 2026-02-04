@@ -1,11 +1,8 @@
 import os, json, requests, re, argparse
-from urllib.parse import unquote
 import sys, traceback
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from PIL import Image
-
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
@@ -15,16 +12,6 @@ USERNAME = "BancoCentral_AR"
 SAVE_DIR = Path("./bcra_imagenes")
 REQUIRED_HASHTAGS = ("#databcra", "#reservasbcra")
 
-_COOKIE_HEADER_KEYS = {
-    "authorization",
-    "Authorization",
-    "user-agent",
-    "x-twitter-auth-type",
-    "x-twitter-active-user",
-    "x-twitter-client-language",
-}
-
-
 def _read_cookies_file(path: Path) -> dict:
     if not path.exists():
         raise RuntimeError(f"No se encontró el archivo de cookies en {path}")
@@ -33,36 +20,6 @@ def _read_cookies_file(path: Path) -> dict:
     except Exception as exc:
         raise RuntimeError(f"No pude parsear {path} como JSON de cookies.") from exc
     return data
-
-
-def _cookies_to_headers(cookies: dict) -> dict:
-    auth = cookies.get("authorization") or cookies.get("Authorization")
-    if not auth:
-        raise RuntimeError("Las cookies no incluyen el header 'authorization'.")
-    ct0 = cookies.get("ct0")
-    if not ct0:
-        raise RuntimeError("Las cookies no incluyen 'ct0'.")
-
-    if "%3D" in auth or "%2F" in auth or "%2B" in auth:
-        auth = unquote(auth)
-
-    headers = {
-        "Authorization": auth if auth.startswith("Bearer ") else f"Bearer {auth}",
-        "x-csrf-token": ct0,
-        "x-twitter-auth-type": cookies.get("x-twitter-auth-type", "OAuth2Session"),
-        "x-twitter-active-user": cookies.get("x-twitter-active-user", "yes"),
-        "x-twitter-client-language": cookies.get("x-twitter-client-language", "en"),
-        "User-Agent": cookies.get(
-            "user-agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        ),
-        "Referer": "https://x.com/",
-        "Origin": "https://x.com",
-    }
-    guest_token = cookies.get("gt") or cookies.get("guest_token")
-    if guest_token:
-        headers["x-guest-token"] = str(guest_token)
-    return headers
 
 
 def ba_today():
@@ -87,6 +44,9 @@ def _cookie_domains() -> list[str]:
         if default_domain not in domains:
             domains.append(default_domain)
     return domains
+
+
+_COOKIE_HEADER_KEYS = {"user-agent", "authorization", "Authorization"}
 
 
 def _cookies_to_playwright_list(cookies: dict) -> list[dict]:
@@ -294,275 +254,6 @@ def _perform_twitter_login(context, cookies_path: Path) -> bool:
         print(f"[LOGIN] Error durante login: {e}", flush=True)
         print(f"[LOGIN] URL actual: {page.url}", flush=True)
         return False
-    finally:
-        page.close()
-
-
-def _needs_login(page) -> bool:
-    """Check if the current page indicates we need to log in."""
-    url = page.url
-    if "/i/flow/login" in url or "/login" in url:
-        return True
-    # Check for empty/blocked page (no content loaded)
-    try:
-        title = page.title()
-        if not title or title.strip() == "":
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _normalize_tweet_date(iso_ts: str) -> str:
-    try:
-        return datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).date().isoformat()
-    except Exception:
-        return ""
-
-
-def _build_search_query(target_date) -> str:
-    since = target_date.isoformat()
-    until = (target_date + timedelta(days=1)).isoformat()
-    # Usar OR para los hashtags (el tweet puede tener cualquiera de los dos)
-    return (
-        f"from:{USERNAME} ({REQUIRED_HASHTAGS[0]} OR {REQUIRED_HASHTAGS[1]}) "
-        f"filter:images since:{since} until:{until}"
-    )
-
-
-def _collect_status_urls(page) -> list[str]:
-    urls: list[str] = []
-    try:
-        anchors = page.locator('a[href*="/status/"]')
-        count = anchors.count()
-        for idx in range(min(count, 60)):
-            href = anchors.nth(idx).get_attribute("href")
-            if not href:
-                continue
-            if href.startswith("/"):
-                href = f"https://x.com{href}"
-            if href not in urls:
-                urls.append(href)
-    except Exception:
-        return urls
-    return urls
-
-
-def _fetch_image_from_status_urls(context, status_urls: list[str], target_date) -> str:
-    target_iso = target_date.isoformat()
-    for url in status_urls[:25]:
-        page = context.new_page()
-        try:
-            page.set_default_timeout(60000)
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            if "/i/flow/login" in page.url or "/login" in page.url:
-                continue
-            time_el = page.locator("time")
-            if time_el.count() == 0:
-                continue
-            iso_ts = time_el.first.get_attribute("datetime") or ""
-            if _normalize_tweet_date(iso_ts) != target_iso:
-                continue
-            text = ""
-            try:
-                text = (page.locator("article").first.inner_text() or "").lower()
-            except Exception:
-                text = ""
-            if text and not all(tag in text for tag in REQUIRED_HASHTAGS):
-                continue
-            meta_img = page.locator('meta[property="og:image"]')
-            if meta_img.count() > 0:
-                src = meta_img.first.get_attribute("content")
-                if src:
-                    if "name=" in src:
-                        src = re.sub(r"name=[a-z]+", "name=large", src)
-                    return src
-            img = page.locator("img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
-            if img.count() > 0:
-                src = img.first.get_attribute("src")
-                if src:
-                    if "name=" in src:
-                        src = re.sub(r"name=[a-z]+", "name=large", src)
-                    return src
-        finally:
-            page.close()
-    raise RuntimeError("No encontré imagen navegando a statuses desde perfil/media.")
-
-
-def _fetch_image_url_with_playwright_search(context, target_date) -> str:
-    """Busca imagen usando X search con filtro de fecha. Simple y directo."""
-    query = _build_search_query(target_date)
-    search_url = f"https://x.com/search?q={requests.utils.quote(query)}&f=live"
-
-    page = context.new_page()
-    try:
-        page.set_default_timeout(60000)
-        print(f"[SEARCH] Navegando a: {search_url}", flush=True)
-        page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-
-        # Esperar que cargue el contenido
-        page.wait_for_timeout(3000)
-
-        if "/i/flow/login" in page.url or "/login" in page.url:
-            raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
-
-        # La búsqueda ya filtra por fecha, cuenta y hashtags.
-        # Si hay imagen en los resultados, es la que buscamos.
-        for attempt in range(5):
-            # Buscar imágenes de Twitter media
-            img = page.locator("img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
-            if img.count() > 0:
-                src = img.first.get_attribute("src")
-                if src:
-                    if "name=" in src:
-                        src = re.sub(r"name=[a-z]+", "name=large", src)
-                    print(f"[SEARCH] Imagen encontrada: {src[:80]}...", flush=True)
-                    return src
-
-            # Scroll y esperar más contenido
-            page.mouse.wheel(0, 1000)
-            page.wait_for_timeout(2000)
-
-        # Debug: guardar screenshot si falla
-        try:
-            page.screenshot(path="/tmp/search_debug.png")
-            print("[SEARCH] Screenshot guardado en /tmp/search_debug.png", flush=True)
-        except Exception:
-            pass
-
-        raise RuntimeError(f"No encontré imagen en búsqueda para {target_date}")
-    finally:
-        page.close()
-
-
-def _fetch_image_url_with_playwright_profile(context, target_date) -> str:
-    profile_url = f"https://x.com/{USERNAME}"
-    page = context.new_page()
-    try:
-        page.set_default_timeout(60000)
-        page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=60000)
-        except Exception:
-            pass
-        if "/i/flow/login" in page.url or "/login" in page.url:
-            raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
-        target_iso = target_date.isoformat()
-        candidates = page.locator("article, div[data-testid='cellInnerDiv']")
-        for _ in range(8):
-            if candidates.count() == 0:
-                page.wait_for_timeout(1500)
-                page.mouse.wheel(0, 1400)
-                continue
-            for idx in range(candidates.count()):
-                try:
-                    node = candidates.nth(idx)
-                    time_el = node.locator("time")
-                    if time_el.count() == 0:
-                        continue
-                    iso_ts = time_el.first.get_attribute("datetime") or ""
-                    if _normalize_tweet_date(iso_ts) != target_iso:
-                        continue
-                    text = ""
-                    try:
-                        text = (node.inner_text() or "").lower()
-                    except Exception:
-                        text = ""
-                    if text and not all(tag in text for tag in REQUIRED_HASHTAGS):
-                        continue
-                    img = node.locator("img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
-                    if img.count() == 0:
-                        continue
-                    src = img.first.get_attribute("src")
-                    if not src:
-                        continue
-                    if "name=" in src:
-                        src = re.sub(r"name=[a-z]+", "name=large", src)
-                    return src
-                except Exception:
-                    continue
-            page.mouse.wheel(0, 1400)
-            page.wait_for_timeout(1500)
-        title = ""
-        try:
-            title = page.title()
-        except Exception:
-            title = ""
-        raise RuntimeError(
-            f"No encontré imagen en perfil. url={page.url} title={title}"
-        )
-    finally:
-        page.close()
-
-
-def _fetch_image_url_with_playwright_profile_media(context, target_date) -> str:
-    media_url = f"https://x.com/{USERNAME}/media"
-    page = context.new_page()
-    try:
-        page.set_default_timeout(60000)
-        page.goto(media_url, wait_until="domcontentloaded", timeout=60000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=60000)
-        except Exception:
-            pass
-        if "/i/flow/login" in page.url or "/login" in page.url:
-            raise RuntimeError("X redirigió al login; cookies inválidas o expiradas.")
-        target_iso = target_date.isoformat()
-        candidates = page.locator("article, div[data-testid='cellInnerDiv']")
-        found_dates = []  # Debug: track what dates we find
-        debug_time_count = 0  # Debug: count how many candidates have time elements
-        debug_no_time_count = 0  # Debug: count candidates without time
-        for _ in range(8):
-            if candidates.count() == 0:
-                page.wait_for_timeout(1500)
-                page.mouse.wheel(0, 1400)
-                continue
-            for idx in range(candidates.count()):
-                try:
-                    node = candidates.nth(idx)
-                    time_el = node.locator("time")
-                    if time_el.count() == 0:
-                        debug_no_time_count += 1
-                        continue
-                    debug_time_count += 1
-                    iso_ts = time_el.first.get_attribute("datetime") or ""
-                    tweet_date = _normalize_tweet_date(iso_ts)
-                    if tweet_date and tweet_date not in found_dates:
-                        found_dates.append(tweet_date)
-                    if tweet_date != target_iso:
-                        continue
-                    img = node.locator("img[src*='twimg.com/media'], img[src*='pbs.twimg.com/media']")
-                    if img.count() == 0:
-                        continue
-                    src = img.first.get_attribute("src")
-                    if not src:
-                        continue
-                    if "name=" in src:
-                        src = re.sub(r"name=[a-z]+", "name=large", src)
-                    return src
-                except Exception:
-                    continue
-            page.mouse.wheel(0, 1400)
-            page.wait_for_timeout(1500)
-        # Debug output
-        print(f"[DEBUG] Buscando fecha: {target_iso}", flush=True)
-        if found_dates:
-            print(f"[DEBUG] Fechas encontradas en profile/media: {found_dates[:10]}", flush=True)
-        else:
-            print(f"[DEBUG] No se encontraron fechas en profile/media. Candidatos encontrados: {candidates.count()}", flush=True)
-        status_urls = _collect_status_urls(page)
-        try:
-            return _fetch_image_from_status_urls(context, status_urls, target_date)
-        except Exception:
-            pass
-        title = ""
-        try:
-            title = page.title()
-        except Exception:
-            title = ""
-        raise RuntimeError(
-            f"No encontré imagen en perfil/media. url={page.url} title={title}"
-        )
     finally:
         page.close()
 
@@ -843,76 +534,67 @@ def _clean_text(texto: str) -> str:
 def parse_bcra_text_to_json(texto_ocr: str) -> dict:
     """
     Parsea el texto OCR y devuelve {fecha, reservas_millones_usd, compra_venta_divisas_millones_usd}.
-    Maneja tanto el formato donde el número viene ANTES del label (Tesseract)
-    como el formato donde viene DESPUÉS.
+    Compatible con Tesseract y Google Cloud Vision.
     """
     texto = _clean_text(texto_ocr)
     low = texto.lower()
 
     fecha = _extract_fecha(texto)
 
-    reservas = None
-    # Patrón 1: número ANTES de "reservas"
-    m_res_before = re.search(r"([\d\.,]+)\s+reservas", low, flags=re.IGNORECASE)
-    if m_res_before:
+    # Extraer todos los números del texto (excluyendo referencias)
+    all_numbers = []
+    for m in re.finditer(r"[-+]?[\d\.,]+", texto):
         try:
-            reservas = _normalize_number_es(m_res_before.group(1))
-        except Exception:
-            reservas = None
-
-    # Patrón 2: "reservas" seguido de número (con texto basura en el medio)
-    if reservas is None:
-        m_res_after = re.search(r"reservas\s+(?:en\s+)?(?:millones\s+)?(?:de\s+)?(?:usd)?\W{0,20}([\d\.,]+)", low, flags=re.IGNORECASE)
-        if m_res_after:
-            try:
-                reservas = _normalize_number_es(m_res_after.group(1))
-            except Exception:
-                reservas = None
-
-    # Patrón 3: buscar número grande (>10000)
-    if reservas is None:
-        all_numbers = re.findall(r"[\d\.,]+", low)
-        for num_str in all_numbers:
-            try:
-                val = _normalize_number_es(num_str)
-                if val > 10000:
-                    reservas = val
-                    break
-            except Exception:
+            val = _normalize_number_es(m.group())
+            pos = m.start()
+            # Excluir números entre paréntesis (son referencias como (1), (2))
+            if pos > 0 and texto[pos - 1] == "(":
                 continue
+            if m.end() < len(texto) and texto[m.end()] == ")":
+                continue
+            # Excluir números después de "Comunicación" (son códigos de regulación)
+            previo = texto[max(0, pos - 15):pos].lower()
+            if "comunicación" in previo or "comunicacion" in previo:
+                continue
+            all_numbers.append((val, m.start(), m.group()))
+        except Exception:
+            continue
 
+    # RESERVAS: número entre 40000 y 100000 (millones USD)
+    # Las reservas del BCRA típicamente están en ese rango
+    reservas = None
+    reservas_pos = 0
+    for val, pos, raw in all_numbers:
+        if 40000 <= val <= 100000:
+            reservas = val
+            reservas_pos = pos
+            break
+
+    # COMPRA/VENTA: número entre -500 y 500 que aparece DESPUÉS de reservas
+    # y que NO sea porcentaje ni referencia
     compra_venta = 0.0
     if "sin intervención" in low or "sin intervencion" in low:
         compra_venta = 0.0
     else:
-        # Patrón 1: número ANTES de "compra"
-        m_cv_before = re.search(r"([-+]?\s*[\d\.,\]]+)\s+compra", low, flags=re.IGNORECASE)
-        if m_cv_before:
-            try:
-                compra_venta = _normalize_number_es(m_cv_before.group(1))
-            except Exception:
-                compra_venta = 0.0
-
-        # Patrón 2: "compra/venta" seguido de número
-        if compra_venta == 0.0:
-            m_cv_after = re.search(r"(compra|venta)\s+de\s+divisas\D{0,30}([-+]?\s*[\d\.,]+)", low, flags=re.IGNORECASE)
-            if m_cv_after:
-                try:
-                    compra_venta = _normalize_number_es(m_cv_after.group(2))
-                except Exception:
-                    compra_venta = 0.0
-
-        # Patrón 3: buscar número pequeño (1-500) que no sea día
-        if compra_venta == 0.0:
-            all_numbers = re.findall(r"[\d\.,]+", low)
-            for num_str in all_numbers:
-                try:
-                    val = _normalize_number_es(num_str)
-                    if 1 <= val <= 500 and val != 19:
-                        compra_venta = val
-                        break
-                except Exception:
+        for val, pos, raw in all_numbers:
+            # Debe aparecer después de reservas en el texto
+            if pos <= reservas_pos:
+                continue
+            if val == reservas:
+                continue
+            if not (-500 <= val <= 500):
+                continue
+            # Verificar que no sea porcentaje
+            siguiente = texto[pos + len(raw):pos + len(raw) + 5] if pos + len(raw) < len(texto) else ""
+            if "%" in siguiente:
+                continue
+            # Verificar que no sea día del mes (seguido de "de enero", etc.)
+            if 1 <= val <= 31:
+                contexto = texto[pos:pos + 30].lower()
+                if " de enero" in contexto or " de febrero" in contexto or " de marzo" in contexto:
                     continue
+            compra_venta = val
+            break
 
     if reservas is None:
         raise RuntimeError("No pude extraer 'reservas_millones_usd' del OCR.")
@@ -925,35 +607,38 @@ def parse_bcra_text_to_json(texto_ocr: str) -> dict:
 
 
 # =========================================================
-# === OCR CON TESSERACT ===================================
+# === OCR CON GOOGLE CLOUD VISION =========================
 # =========================================================
 
 def parse_bcra_image(img_path: Path) -> dict:
-    """OCR usando Tesseract + parseo por regex."""
+    """OCR usando Google Cloud Vision API."""
     try:
-        import pytesseract
+        from google.cloud import vision
     except ImportError as exc:
         raise RuntimeError(
-            "Falta instalar 'pytesseract'. Ejecutá: pip install pytesseract"
+            "Falta instalar 'google-cloud-vision'. Ejecutá: pip install google-cloud-vision"
         ) from exc
 
-    print("[OCR] Ejecutando Tesseract...", flush=True)
-    image = Image.open(img_path)
+    print("[OCR] Ejecutando Google Cloud Vision...", flush=True)
 
-    # Preprocesar imagen: binarización con threshold 120
-    # Esto mejora el reconocimiento de dígitos preservando puntos decimales
-    image_gray = image.convert("L")
-    image_binary = image_gray.point(lambda x: 255 if x > 120 else 0, '1')
+    client = vision.ImageAnnotatorClient()
 
-    # PSM 6 (uniform block) funciona bien con texto estructurado
-    texto = pytesseract.image_to_string(image_binary, lang='spa+eng', config='--psm 6')
+    # Leer imagen
+    with open(img_path, "rb") as f:
+        content = f.read()
+
+    image = vision.Image(content=content)
+
+    # Ejecutar OCR (document_text_detection es mejor para texto estructurado)
+    response = client.document_text_detection(image=image)
+
+    if response.error.message:
+        raise RuntimeError(f"Google Vision API error: {response.error.message}")
+
+    texto = response.full_text_annotation.text
 
     if not texto.strip():
-        # Fallback a PSM 11 si PSM 6 no devuelve nada
-        texto = pytesseract.image_to_string(image_binary, lang='spa+eng', config='--psm 11')
-
-    if not texto.strip():
-        raise RuntimeError("Tesseract no devolvió texto.")
+        raise RuntimeError("Google Cloud Vision no devolvió texto.")
 
     print(f"[OCR] Texto extraído ({len(texto)} chars)", flush=True)
     return parse_bcra_text_to_json(texto)
@@ -1089,7 +774,7 @@ def main():
         print("=== Descargando imagen del BCRA desde X ===", flush=True)
         img_path = download_bcra_image(target_date)
 
-        print("=== Parseando imagen con Tesseract ===", flush=True)
+        print("=== Parseando imagen con Google Cloud Vision ===", flush=True)
         parsed = parse_bcra_image(img_path)
         print("JSON parseado:", flush=True)
         print(json.dumps(parsed, indent=2, ensure_ascii=False), flush=True)
